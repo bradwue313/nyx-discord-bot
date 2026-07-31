@@ -1,10 +1,11 @@
 {
   "name": "nyx-discord-bot",
-  "version": "1.0.0",
+  "version": "2.1.0",
   "description": "NYX External Discord license administration bot",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "test": "node --check bot.js"
   },
   "dependencies": {
     "discord.js": "^14.14.1"
