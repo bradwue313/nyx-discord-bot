@@ -11,12 +11,16 @@ const CONFIG = {
     TOKEN: process.env.BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE',
     CLIENT_ID: process.env.CLIENT_ID || 'YOUR_CLIENT_ID_HERE',
     PORT: process.env.PORT || 3000,
-    KEYS_FILE: path.join(__dirname, 'keys.json')
+    KEYS_FILE: path.join(__dirname, 'keys.json'),
+    ALLOWED_ROLES_FILE: path.join(__dirname, 'allowed_roles.json')
 };
 
-// Ensure database file exists
+// Ensure database files exist
 if (!fs.existsSync(CONFIG.KEYS_FILE)) {
     fs.writeFileSync(CONFIG.KEYS_FILE, JSON.stringify({}, null, 4));
+}
+if (!fs.existsSync(CONFIG.ALLOWED_ROLES_FILE)) {
+    fs.writeFileSync(CONFIG.ALLOWED_ROLES_FILE, JSON.stringify([], null, 4));
 }
 
 function loadKeys() {
@@ -29,6 +33,25 @@ function loadKeys() {
 
 function saveKeys(data) {
     fs.writeFileSync(CONFIG.KEYS_FILE, JSON.stringify(data, null, 4));
+}
+
+function loadAllowedRoles() {
+    try {
+        return JSON.parse(fs.readFileSync(CONFIG.ALLOWED_ROLES_FILE, 'utf8'));
+    } catch {
+        return [];
+    }
+}
+
+function saveAllowedRoles(roles) {
+    fs.writeFileSync(CONFIG.ALLOWED_ROLES_FILE, JSON.stringify(roles, null, 4));
+}
+
+function hasGenPermission(member) {
+    if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+    const allowedRoles = loadAllowedRoles();
+    if (allowedRoles.length === 0) return false;
+    return member.roles.cache.some(role => allowedRoles.includes(role.id));
 }
 
 // Generate key formatted as NYX-XXXX-XXXX-XXXX
@@ -55,13 +78,12 @@ function getExpiryTimestamp(duration) {
 // ==========================================
 // DISCORD BOT CLIENT
 // ==========================================
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
 
 const commands = [
     new SlashCommandBuilder()
         .setName('keygen')
         .setDescription('Generate NYX License Keys')
-        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
         .addStringOption(option =>
             option.setName('duration')
                 .setDescription('Select key validity duration')
@@ -80,9 +102,26 @@ const commands = [
                 .setRequired(false)),
 
     new SlashCommandBuilder()
+        .setName('setgenrole')
+        .setDescription('Add or remove a role allowed to generate keys')
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+        .addStringOption(option =>
+            option.setName('action')
+                .setDescription('Add or remove role')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'Add Role', value: 'add' },
+                    { name: 'Remove Role', value: 'remove' },
+                    { name: 'List Allowed Roles', value: 'list' }
+                ))
+        .addRoleOption(option =>
+            option.setName('role')
+                .setDescription('The role to allow/deny')
+                .setRequired(false)),
+
+    new SlashCommandBuilder()
         .setName('keyinfo')
         .setDescription('Check details of a NYX key')
-        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
         .addStringOption(option =>
             option.setName('key')
                 .setDescription('The key to check (NYX-XXXX-XXXX-XXXX)')
@@ -101,7 +140,6 @@ const commands = [
 client.on('ready', async () => {
     console.log(`[NYX BOT] Logged in as ${client.user.tag}`);
     
-    // Register Slash Commands
     if (CONFIG.TOKEN !== 'YOUR_BOT_TOKEN_HERE' && CONFIG.CLIENT_ID !== 'YOUR_CLIENT_ID_HERE') {
         try {
             const rest = new REST({ version: '10' }).setToken(CONFIG.TOKEN);
@@ -116,9 +154,45 @@ client.on('ready', async () => {
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
-    const { commandName } = interaction;
+    const { commandName, member } = interaction;
+
+    if (commandName === 'setgenrole') {
+        const action = interaction.options.getString('action');
+        const role = interaction.options.getRole('role');
+        let allowedRoles = loadAllowedRoles();
+
+        if (action === 'list') {
+            if (allowedRoles.length === 0) {
+                return interaction.reply({ content: 'ℹ️ No generator roles set. Only Administrators can run `/keygen`.', ephemeral: true });
+            }
+            const roleList = allowedRoles.map(id => `<@&${id}>`).join(', ');
+            return interaction.reply({ content: `📋 **Roles allowed to run \`/keygen\`**: ${roleList}`, ephemeral: true });
+        }
+
+        if (!role) {
+            return interaction.reply({ content: '❌ Please select a role.', ephemeral: true });
+        }
+
+        if (action === 'add') {
+            if (!allowedRoles.includes(role.id)) {
+                allowedRoles.push(role.id);
+                saveAllowedRoles(allowedRoles);
+            }
+            return interaction.reply({ content: `✅ Added <@&${role.id}> to key generator roles.`, ephemeral: true });
+        }
+
+        if (action === 'remove') {
+            allowedRoles = allowedRoles.filter(id => id !== role.id);
+            saveAllowedRoles(allowedRoles);
+            return interaction.reply({ content: `✅ Removed <@&${role.id}> from key generator roles.`, ephemeral: true });
+        }
+    }
 
     if (commandName === 'keygen') {
+        if (!hasGenPermission(member)) {
+            return interaction.reply({ content: '❌ You do not have permission to run `/keygen`.', ephemeral: true });
+        }
+
         const duration = interaction.options.getString('duration');
         const amount = Math.min(Math.max(interaction.options.getInteger('amount') || 1, 1), 10);
 
@@ -157,6 +231,10 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (commandName === 'keyinfo') {
+        if (!hasGenPermission(member)) {
+            return interaction.reply({ content: '❌ You do not have permission to check key info.', ephemeral: true });
+        }
+
         const key = interaction.options.getString('key').trim();
         const keysDB = loadKeys();
         const info = keysDB[key];
