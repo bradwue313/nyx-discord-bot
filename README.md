@@ -1,6 +1,6 @@
-# NYX Discord Bot & Key Authentication Server
+# NYX Discord License Bot
 
-This repository contains the Discord Bot (`bot.js`) and REST Key Verification API for **NYX External**.
+This bot generates and administers licenses through the NYX Access website API. The website owns accounts, keys, Discord links, device bindings, and application sessions.
 
 ---
 
@@ -16,9 +16,11 @@ This repository contains the Discord Bot (`bot.js`) and REST Key Verification AP
    ```bash
    npm install
    ```
-6. Set your environment variables in the bot-hosting.net dashboard (or edit `bot.js` directly):
+6. Set these environment variables in the bot-hosting.net dashboard:
    - `BOT_TOKEN`: Your Discord Bot Token (from Discord Developer Portal)
    - `CLIENT_ID`: Your Discord Bot Application Client ID
+   - `NYX_AUTH_URL`: The deployed NYX Access website URL
+   - `BOT_API_SECRET`: The same private API secret configured for the website
 7. Click **Start** to run your 24/7 Discord bot server!
 
 ---
@@ -28,3 +30,6 @@ This repository contains the Discord Bot (`bot.js`) and REST Key Verification AP
 - `/keygen duration:<12h|1d|1w|1m|1y|lifetime> [amount:1-10]`
 - `/keyinfo key:<NYX-XXXX-XXXX-XXXX>`
 - `/keyrevoke key:<NYX-XXXX-XXXX-XXXX>`
+- `/keyreset key:<NYX-...>`
+- `/keyextend key:<NYX-...> duration:<...>`
+- `/mystatus`

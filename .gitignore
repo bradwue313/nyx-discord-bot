@@ -1,0 +1,4 @@
+node_modules/
+.env
+allowed_roles.json
+npm-debug.log*
