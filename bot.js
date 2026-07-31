@@ -1,43 +1,42 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits, REST, Routes } = require('discord.js');
-const express = require('express');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
+const {
+    Client,
+    GatewayIntentBits,
+    SlashCommandBuilder,
+    EmbedBuilder,
+    PermissionFlagsBits,
+    REST,
+    Routes
+} = require("discord.js");
+const fs = require("fs");
+const path = require("path");
 
-// ==========================================
-// CONFIGURATION
-// ==========================================
 const CONFIG = {
-    TOKEN: process.env.BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE',
-    CLIENT_ID: process.env.CLIENT_ID || '1532620882969890826',
-    PORT: process.env.PORT || 3000,
-    KEYS_FILE: path.join(__dirname, 'keys.json'),
-    ALLOWED_ROLES_FILE: path.join(__dirname, 'allowed_roles.json')
+    TOKEN: process.env.BOT_TOKEN,
+    CLIENT_ID: process.env.CLIENT_ID,
+    AUTH_URL: (process.env.NYX_AUTH_URL || "").replace(/\/+$/, ""),
+    API_SECRET: process.env.BOT_API_SECRET,
+    ALLOWED_ROLES_FILE: path.join(__dirname, "allowed_roles.json")
 };
 
-// Ensure database files exist
-if (!fs.existsSync(CONFIG.KEYS_FILE)) {
-    fs.writeFileSync(CONFIG.KEYS_FILE, JSON.stringify({}, null, 4));
+for (const [name, value] of Object.entries({
+    BOT_TOKEN: CONFIG.TOKEN,
+    CLIENT_ID: CONFIG.CLIENT_ID,
+    NYX_AUTH_URL: CONFIG.AUTH_URL,
+    BOT_API_SECRET: CONFIG.API_SECRET
+})) {
+    if (!value) {
+        console.error(`[NYX BOT] Missing required environment variable: ${name}`);
+        process.exit(1);
+    }
 }
+
 if (!fs.existsSync(CONFIG.ALLOWED_ROLES_FILE)) {
     fs.writeFileSync(CONFIG.ALLOWED_ROLES_FILE, JSON.stringify([], null, 4));
 }
 
-function loadKeys() {
-    try {
-        return JSON.parse(fs.readFileSync(CONFIG.KEYS_FILE, 'utf8'));
-    } catch {
-        return {};
-    }
-}
-
-function saveKeys(data) {
-    fs.writeFileSync(CONFIG.KEYS_FILE, JSON.stringify(data, null, 4));
-}
-
 function loadAllowedRoles() {
     try {
-        return JSON.parse(fs.readFileSync(CONFIG.ALLOWED_ROLES_FILE, 'utf8'));
+        return JSON.parse(fs.readFileSync(CONFIG.ALLOWED_ROLES_FILE, "utf8"));
     } catch {
         return [];
     }
@@ -47,279 +46,228 @@ function saveAllowedRoles(roles) {
     fs.writeFileSync(CONFIG.ALLOWED_ROLES_FILE, JSON.stringify(roles, null, 4));
 }
 
-function hasGenPermission(member) {
-    if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+function isAdministrator(member) {
+    return member.permissions.has(PermissionFlagsBits.Administrator);
+}
+
+function hasGeneratorPermission(member) {
+    if (isAdministrator(member)) return true;
     const allowedRoles = loadAllowedRoles();
-    if (allowedRoles.length === 0) return false;
-    return member.roles.cache.some(role => allowedRoles.includes(role.id));
+    return allowedRoles.length > 0 && member.roles.cache.some((role) => allowedRoles.includes(role.id));
 }
 
-// Generate key formatted as NYX-XXXX-XXXX-XXXX
-function generateNYXKey() {
-    const part1 = crypto.randomBytes(2).toString('hex').toUpperCase();
-    const part2 = crypto.randomBytes(2).toString('hex').toUpperCase();
-    const part3 = crypto.randomBytes(2).toString('hex').toUpperCase();
-    return `NYX-${part1}-${part2}-${part3}`;
-}
-
-function getExpiryTimestamp(duration) {
-    const now = Date.now();
-    switch (duration) {
-        case '12h': return now + (12 * 60 * 60 * 1000);
-        case '1d':  return now + (24 * 60 * 60 * 1000);
-        case '1w':  return now + (7 * 24 * 60 * 60 * 1000);
-        case '1m':  return now + (30 * 24 * 60 * 60 * 1000);
-        case '1y':  return now + (365 * 24 * 60 * 60 * 1000);
-        case 'lifetime': return -1;
-        default: return now + (24 * 60 * 60 * 1000);
+async function callAuthApi(pathname, body) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+    try {
+        const response = await fetch(`${CONFIG.AUTH_URL}${pathname}`, {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${CONFIG.API_SECRET}`,
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            },
+            body: JSON.stringify(body),
+            signal: controller.signal
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload.success) {
+            throw new Error(payload.message || `Website API returned HTTP ${response.status}`);
+        }
+        return payload;
+    } finally {
+        clearTimeout(timeout);
     }
 }
 
-// ==========================================
-// DISCORD BOT CLIENT
-// ==========================================
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
+function formatTimestamp(value) {
+    if (!value) return "Not set";
+    return `<t:${Math.floor(Number(value))}:F>`;
+}
+
+const client = new Client({
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
+});
+
+const durations = [
+    { name: "12 Hours", value: "12h" },
+    { name: "1 Day", value: "1d" },
+    { name: "1 Week", value: "1w" },
+    { name: "1 Month", value: "1m" },
+    { name: "1 Year", value: "1y" },
+    { name: "Lifetime", value: "lifetime" }
+];
 
 const commands = [
     new SlashCommandBuilder()
-        .setName('keygen')
-        .setDescription('Generate NYX License Keys')
-        .addStringOption(option =>
-            option.setName('duration')
-                .setDescription('Select key validity duration')
-                .setRequired(true)
-                .addChoices(
-                    { name: '12 Hours', value: '12h' },
-                    { name: '1 Day', value: '1d' },
-                    { name: '1 Week', value: '1w' },
-                    { name: '1 Month', value: '1m' },
-                    { name: '1 Year', value: '1y' },
-                    { name: 'Lifetime', value: 'lifetime' }
-                ))
-        .addIntegerOption(option =>
-            option.setName('amount')
-                .setDescription('Number of keys to generate (1-10)')
-                .setRequired(false)),
-
+        .setName("keygen")
+        .setDescription("Generate NYX website license keys")
+        .addStringOption((option) =>
+            option.setName("duration").setDescription("License duration after activation").setRequired(true).addChoices(...durations))
+        .addIntegerOption((option) =>
+            option.setName("amount").setDescription("Number of keys, from 1 to 10").setMinValue(1).setMaxValue(10)),
     new SlashCommandBuilder()
-        .setName('setgenrole')
-        .setDescription('Add or remove a role allowed to generate keys')
+        .setName("setgenrole")
+        .setDescription("Manage roles allowed to generate keys")
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-        .addStringOption(option =>
-            option.setName('action')
-                .setDescription('Add or remove role')
-                .setRequired(true)
-                .addChoices(
-                    { name: 'Add Role', value: 'add' },
-                    { name: 'Remove Role', value: 'remove' },
-                    { name: 'List Allowed Roles', value: 'list' }
-                ))
-        .addRoleOption(option =>
-            option.setName('role')
-                .setDescription('The role to allow/deny')
-                .setRequired(false)),
-
+        .addStringOption((option) =>
+            option.setName("action").setDescription("Role action").setRequired(true).addChoices(
+                { name: "Add Role", value: "add" },
+                { name: "Remove Role", value: "remove" },
+                { name: "List Allowed Roles", value: "list" }
+            ))
+        .addRoleOption((option) => option.setName("role").setDescription("Role to add or remove")),
     new SlashCommandBuilder()
-        .setName('keyinfo')
-        .setDescription('Check details of a NYX key')
-        .addStringOption(option =>
-            option.setName('key')
-                .setDescription('The key to check (NYX-XXXX-XXXX-XXXX)')
-                .setRequired(true)),
-
+        .setName("keyinfo")
+        .setDescription("Check a NYX license")
+        .addStringOption((option) => option.setName("key").setDescription("Complete NYX key").setRequired(true)),
     new SlashCommandBuilder()
-        .setName('keyrevoke')
-        .setDescription('Revoke/Delete a NYX key')
+        .setName("keyrevoke")
+        .setDescription("Revoke a NYX license")
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-        .addStringOption(option =>
-            option.setName('key')
-                .setDescription('The key to revoke')
-                .setRequired(true))
+        .addStringOption((option) => option.setName("key").setDescription("Complete NYX key").setRequired(true)),
+    new SlashCommandBuilder()
+        .setName("keyreset")
+        .setDescription("Reset the device attached to a NYX license")
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+        .addStringOption((option) => option.setName("key").setDescription("Complete NYX key").setRequired(true)),
+    new SlashCommandBuilder()
+        .setName("keyextend")
+        .setDescription("Replace the expiration period for a NYX license")
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+        .addStringOption((option) => option.setName("key").setDescription("Complete NYX key").setRequired(true))
+        .addStringOption((option) =>
+            option.setName("duration").setDescription("New duration from now").setRequired(true).addChoices(...durations)),
+    new SlashCommandBuilder()
+        .setName("mystatus")
+        .setDescription("Check whether your Discord is linked to an active NYX account")
 ];
 
-client.on('ready', async () => {
+client.once("ready", async () => {
     console.log(`[NYX BOT] Logged in as ${client.user.tag}`);
-    
-    if (CONFIG.TOKEN !== 'YOUR_BOT_TOKEN_HERE' && CONFIG.CLIENT_ID !== 'YOUR_CLIENT_ID_HERE') {
-        try {
-            const rest = new REST({ version: '10' }).setToken(CONFIG.TOKEN);
-            await rest.put(Routes.applicationCommands(CONFIG.CLIENT_ID), { body: commands });
-            console.log('[NYX BOT] Slash commands registered successfully.');
-        } catch (err) {
-            console.error('[NYX BOT] Error registering commands:', err.message);
-        }
+    try {
+        const rest = new REST({ version: "10" }).setToken(CONFIG.TOKEN);
+        await rest.put(Routes.applicationCommands(CONFIG.CLIENT_ID), {
+            body: commands.map((command) => command.toJSON())
+        });
+        console.log("[NYX BOT] Slash commands registered.");
+    } catch (error) {
+        console.error("[NYX BOT] Command registration failed:", error.message);
     }
 });
 
-client.on('interactionCreate', async interaction => {
+client.on("interactionCreate", async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
-
     const { commandName, member } = interaction;
 
-    if (commandName === 'setgenrole') {
-        const action = interaction.options.getString('action');
-        const role = interaction.options.getRole('role');
-        let allowedRoles = loadAllowedRoles();
-
-        if (action === 'list') {
-            if (allowedRoles.length === 0) {
-                return interaction.reply({ content: 'ℹ️ No generator roles set. Only Administrators can run `/keygen`.', ephemeral: true });
+    try {
+        if (commandName === "setgenrole") {
+            if (!isAdministrator(member)) {
+                return interaction.reply({ content: "You must be an administrator.", ephemeral: true });
             }
-            const roleList = allowedRoles.map(id => `<@&${id}>`).join(', ');
-            return interaction.reply({ content: `📋 **Roles allowed to run \`/keygen\`**: ${roleList}`, ephemeral: true });
-        }
-
-        if (!role) {
-            return interaction.reply({ content: '❌ Please select a role.', ephemeral: true });
-        }
-
-        if (action === 'add') {
-            if (!allowedRoles.includes(role.id)) {
-                allowedRoles.push(role.id);
-                saveAllowedRoles(allowedRoles);
+            const action = interaction.options.getString("action");
+            const role = interaction.options.getRole("role");
+            let allowedRoles = loadAllowedRoles();
+            if (action === "list") {
+                const value = allowedRoles.length ? allowedRoles.map((id) => `<@&${id}>`).join(", ") : "No generator roles configured.";
+                return interaction.reply({ content: value, ephemeral: true });
             }
-            return interaction.reply({ content: `✅ Added <@&${role.id}> to key generator roles.`, ephemeral: true });
-        }
-
-        if (action === 'remove') {
-            allowedRoles = allowedRoles.filter(id => id !== role.id);
+            if (!role) return interaction.reply({ content: "Select a role.", ephemeral: true });
+            if (action === "add" && !allowedRoles.includes(role.id)) allowedRoles.push(role.id);
+            if (action === "remove") allowedRoles = allowedRoles.filter((id) => id !== role.id);
             saveAllowedRoles(allowedRoles);
-            return interaction.reply({ content: `✅ Removed <@&${role.id}> from key generator roles.`, ephemeral: true });
-        }
-    }
-
-    if (commandName === 'keygen') {
-        if (!hasGenPermission(member)) {
-            return interaction.reply({ content: '❌ You do not have permission to run `/keygen`.', ephemeral: true });
+            return interaction.reply({ content: `${action === "add" ? "Added" : "Removed"} <@&${role.id}>.`, ephemeral: true });
         }
 
-        const duration = interaction.options.getString('duration');
-        const amount = Math.min(Math.max(interaction.options.getInteger('amount') || 1, 1), 10);
-
-        const keysDB = loadKeys();
-        const generatedKeys = [];
-
-        for (let i = 0; i < amount; i++) {
-            const key = generateNYXKey();
-            const expiresAt = getExpiryTimestamp(duration);
-
-            keysDB[key] = {
-                duration: duration,
-                created_by: interaction.user.tag,
-                created_at: Date.now(),
-                expires_at: expiresAt,
-                hwid: null,
-                used: false
-            };
-            generatedKeys.push(key);
+        if (commandName === "keygen") {
+            if (!hasGeneratorPermission(member)) {
+                return interaction.reply({ content: "You do not have permission to generate keys.", ephemeral: true });
+            }
+            await interaction.deferReply({ ephemeral: true });
+            const duration = interaction.options.getString("duration");
+            const amount = interaction.options.getInteger("amount") || 1;
+            const result = await callAuthApi("/api/bot/keys", {
+                action: "generate",
+                duration,
+                amount,
+                createdBy: `${interaction.user.tag} (${interaction.user.id})`
+            });
+            const embed = new EmbedBuilder()
+                .setTitle("NYX website license generated")
+                .setColor("#C8FF48")
+                .setDescription(`\`\`\`\n${result.keys.join("\n")}\n\`\`\``)
+                .addFields(
+                    { name: "Duration", value: duration.toUpperCase(), inline: true },
+                    { name: "Quantity", value: String(result.keys.length), inline: true },
+                    { name: "Activation", value: "Starts when registered", inline: true }
+                )
+                .setFooter({ text: "These keys are displayed in full only here." });
+            return interaction.editReply({ embeds: [embed] });
         }
 
-        saveKeys(keysDB);
-
-        const embed = new EmbedBuilder()
-            .setTitle('🔑 NYX License Key Generated')
-            .setColor('#FFFFFF')
-            .addFields(
-                { name: 'Keys Generated', value: `\`\`\`${generatedKeys.join('\n')}\`\`\`` },
-                { name: 'Duration', value: duration.toUpperCase(), inline: true },
-                { name: 'Quantity', value: `${amount}`, inline: true },
-                { name: 'Created By', value: interaction.user.tag, inline: true }
-            )
-            .setFooter({ text: 'NYX External Auth System' });
-
-        await interaction.reply({ embeds: [embed], ephemeral: true });
-    }
-
-    if (commandName === 'keyinfo') {
-        if (!hasGenPermission(member)) {
-            return interaction.reply({ content: '❌ You do not have permission to check key info.', ephemeral: true });
+        if (commandName === "keyinfo") {
+            if (!hasGeneratorPermission(member)) {
+                return interaction.reply({ content: "You do not have permission to inspect keys.", ephemeral: true });
+            }
+            await interaction.deferReply({ ephemeral: true });
+            const result = await callAuthApi("/api/bot/keys", {
+                action: "info",
+                key: interaction.options.getString("key").trim()
+            });
+            const license = result.license;
+            const status = license.revokedAt ? "Revoked" : license.username ? "Activated" : "Unused";
+            const embed = new EmbedBuilder()
+                .setTitle(`License ${license.keyPreview}`)
+                .setColor(status === "Revoked" ? "#FF6B57" : "#C8FF48")
+                .addFields(
+                    { name: "Status", value: status, inline: true },
+                    { name: "Duration", value: String(license.duration).toUpperCase(), inline: true },
+                    { name: "Account", value: license.username || "Not registered", inline: true },
+                    { name: "Discord", value: license.discordUsername ? `@${license.discordUsername}` : "Not linked", inline: true },
+                    { name: "Activated", value: formatTimestamp(license.activatedAt), inline: true },
+                    { name: "Expires", value: license.duration === "lifetime" ? "Lifetime" : formatTimestamp(license.expiresAt), inline: true },
+                    { name: "Device", value: license.deviceId ? `${license.deviceId.slice(0, 12)}…` : "Not bound", inline: false }
+                );
+            return interaction.editReply({ embeds: [embed] });
         }
 
-        const key = interaction.options.getString('key').trim();
-        const keysDB = loadKeys();
-        const info = keysDB[key];
-
-        if (!info) {
-            return interaction.reply({ content: `❌ Key \`${key}\` not found in database.`, ephemeral: true });
+        if (["keyrevoke", "keyreset", "keyextend"].includes(commandName)) {
+            if (!isAdministrator(member)) {
+                return interaction.reply({ content: "You must be an administrator.", ephemeral: true });
+            }
+            await interaction.deferReply({ ephemeral: true });
+            const action = commandName === "keyrevoke" ? "revoke" : commandName === "keyreset" ? "reset" : "extend";
+            const result = await callAuthApi("/api/bot/keys", {
+                action,
+                key: interaction.options.getString("key").trim(),
+                duration: interaction.options.getString("duration")
+            });
+            return interaction.editReply({ content: result.message });
         }
 
-        const expStr = info.expires_at === -1 ? 'Lifetime' : new Date(info.expires_at).toUTCString();
-
-        const embed = new EmbedBuilder()
-            .setTitle(`Key Info: ${key}`)
-            .setColor('#00FF88')
-            .addFields(
-                { name: 'Duration', value: info.duration.toUpperCase(), inline: true },
-                { name: 'Status', value: info.used ? 'Activated' : 'Unused', inline: true },
-                { name: 'Expires At', value: expStr, inline: true },
-                { name: 'HWID Bound', value: info.hwid ? `\`${info.hwid}\`` : 'None (Unbound)', inline: false },
-                { name: 'Created By', value: info.created_by, inline: true }
-            );
-
-        await interaction.reply({ embeds: [embed], ephemeral: true });
-    }
-
-    if (commandName === 'keyrevoke') {
-        const key = interaction.options.getString('key').trim();
-        const keysDB = loadKeys();
-
-        if (!keysDB[key]) {
-            return interaction.reply({ content: `❌ Key \`${key}\` does not exist.`, ephemeral: true });
+        if (commandName === "mystatus") {
+            await interaction.deferReply({ ephemeral: true });
+            const result = await callAuthApi("/api/bot/status", { discordId: interaction.user.id });
+            if (!result.linked) {
+                return interaction.editReply({ content: "Your Discord is not linked. Sign in to the NYX website dashboard and choose **Connect Discord**." });
+            }
+            const embed = new EmbedBuilder()
+                .setTitle("Your NYX account")
+                .setColor(result.active ? "#C8FF48" : "#FF6B57")
+                .addFields(
+                    { name: "Website account", value: result.account.username, inline: true },
+                    { name: "License", value: result.active ? "Active" : "Inactive", inline: true },
+                    { name: "Plan", value: result.account.duration.toUpperCase(), inline: true },
+                    { name: "Expires", value: result.account.duration === "lifetime" ? "Lifetime" : formatTimestamp(result.account.expiresAt), inline: true },
+                    { name: "Device", value: result.account.deviceId ? "Bound" : "Not bound", inline: true }
+                );
+            return interaction.editReply({ embeds: [embed] });
         }
-
-        delete keysDB[key];
-        saveKeys(keysDB);
-
-        await interaction.reply({ content: `✅ Key \`${key}\` has been revoked.`, ephemeral: true });
+    } catch (error) {
+        const message = error.name === "AbortError" ? "The NYX website did not respond in time." : error.message;
+        if (interaction.deferred || interaction.replied) return interaction.editReply({ content: `Request failed: ${message}` });
+        return interaction.reply({ content: `Request failed: ${message}`, ephemeral: true });
     }
 });
 
-// ==========================================
-// EXPRESS KEY AUTH API FOR NYX.EXE
-// ==========================================
-const app = express();
-app.use(express.json());
-
-app.post('/api/verify', (req, res) => {
-    const { key, hwid } = req.body;
-
-    if (!key) {
-        return res.status(400).json({ success: false, message: 'Missing key parameter' });
-    }
-
-    const keysDB = loadKeys();
-    const keyData = keysDB[key];
-
-    if (!keyData) {
-        return res.status(400).json({ success: false, message: 'Invalid or non-existent key' });
-    }
-
-    if (keyData.expires_at !== -1 && Date.now() > keyData.expires_at) {
-        return res.status(400).json({ success: false, message: 'Key has expired' });
-    }
-
-    if (!keyData.hwid) {
-        keyData.hwid = hwid || 'GENERATED_HWID';
-        keyData.used = true;
-        saveKeys(keysDB);
-    } else if (hwid && keyData.hwid !== hwid) {
-        return res.status(400).json({ success: false, message: 'HWID mismatch. Reset required.' });
-    }
-
-    return res.json({
-        success: true,
-        message: 'License verified successfully',
-        duration: keyData.duration,
-        expires_at: keyData.expires_at
-    });
-});
-
-app.listen(CONFIG.PORT, () => {
-    console.log(`[NYX API] Server running on port ${CONFIG.PORT}`);
-});
-
-if (CONFIG.TOKEN !== 'YOUR_BOT_TOKEN_HERE') {
-    client.login(CONFIG.TOKEN);
-} else {
-    console.log('[NYX BOT] Please configure your BOT_TOKEN in CONFIG or environment variables.');
-}
+client.login(CONFIG.TOKEN);
