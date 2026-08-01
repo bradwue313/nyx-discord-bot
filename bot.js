@@ -162,6 +162,54 @@ async function sendAudit(title, interaction, details) {
 
 let notificationPollActive = false;
 
+// Licenses whose expiry has already been announced, keyed by license id.
+// Persisted so restarts do not re-announce the same expirations.
+const EXPIRY_REMINDER_FILE = path.join(__dirname, "expiry_reminders.json");
+let announcedExpiries = {};
+try {
+    const parsed = JSON.parse(fs.readFileSync(EXPIRY_REMINDER_FILE, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) announcedExpiries = parsed;
+} catch { /* first run */ }
+
+function saveAnnouncedExpiries() {
+    try {
+        fs.writeFileSync(EXPIRY_REMINDER_FILE, JSON.stringify(announcedExpiries));
+    } catch (error) {
+        console.error(`[NYX BOT] Could not persist expiry reminders: ${error.message}`);
+    }
+}
+
+let expiryPollActive = false;
+
+// DMs each user once per license as their key approaches its expiry, so
+// renewals are not missed. Only licenses expiring within the window are
+// returned by the website, and already-announced expiries are skipped.
+async function pollExpiryReminders() {
+    if (expiryPollActive || !client.isReady()) return;
+    expiryPollActive = true;
+    try {
+        const { expiring = [] } = await callAuthApi("/api/bot/expiring", { windowSeconds: 72 * 60 * 60 });
+        const now = Math.floor(Date.now() / 1000);
+        for (const license of expiring) {
+            const announced = announcedExpiries[license.licenseId];
+            if (announced === license.expiresAt) continue;
+            try {
+                const user = await client.users.fetch(license.discordId);
+                const hoursLeft = Math.max(1, Math.ceil((Number(license.expiresAt) - now) / 3600));
+                await user.send({ embeds: [nyxEmbed("NYX license expiring soon", `Your NYX license (${license.username}) expires in approximately **${hoursLeft} hour${hoursLeft === 1 ? "" : "s"}** (${formatTimestamp(license.expiresAt)}). Renew before it lapses to keep your access active.`)] });
+                announcedExpiries[license.licenseId] = license.expiresAt;
+                saveAnnouncedExpiries();
+            } catch (error) {
+                console.error(`[NYX BOT] Could not send expiry reminder for ${license.licenseId}: ${error.message}`);
+            }
+        }
+    } catch (error) {
+        console.error(`[NYX BOT] Expiry reminder poll failed: ${error.message}`);
+    } finally {
+        expiryPollActive = false;
+    }
+}
+
 async function pollNotifications() {
     if (notificationPollActive || !client.isReady()) return;
     notificationPollActive = true;
@@ -216,6 +264,12 @@ const commands = [
     new SlashCommandBuilder().setName("userlookup").setDescription("Find a NYX account and license")
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
         .addStringOption((option) => option.setName("query").setDescription("Username, email, Discord ID, or Discord username").setRequired(true)),
+    new SlashCommandBuilder().setName("whois").setDescription("Find a NYX account and license (alias for /userlookup)")
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+        .addStringOption((option) => option.setName("query").setDescription("Username, email, Discord ID, or Discord username").setRequired(true)),
+    new SlashCommandBuilder().setName("notifyall").setDescription("Send an announcement DM to every account with release alerts enabled")
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+        .addStringOption((option) => option.setName("message").setDescription("Announcement text").setRequired(true).setMaxLength(500)),
     new SlashCommandBuilder().setName("stats").setDescription("Show live NYX license totals")
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
     new SlashCommandBuilder().setName("health").setDescription("Check the NYX website and authorization service"),
@@ -245,7 +299,9 @@ client.once("ready", async () => {
     await rest.put(Routes.applicationCommands(CONFIG.CLIENT_ID), { body: commands.map((command) => command.toJSON()) });
     console.log(`[NYX BOT] Registered ${commands.length} commands`);
     await pollNotifications();
+    await pollExpiryReminders();
     setInterval(pollNotifications, 60_000).unref();
+    setInterval(pollExpiryReminders, 6 * 60 * 60 * 1000).unref();
 });
 
 function confirmationRow(id) {
@@ -298,7 +354,7 @@ client.on("interactionCreate", async (interaction) => {
                 .addFields(
                     { name: "Account", value: "`/mystatus` — check your linked account\n`/health` — check service availability", inline: false },
                     { name: "License team", value: "`/keygen` `/keyinfo` `/keys`", inline: false },
-                    { name: "Administrators", value: "`/stats` `/userlookup` `/keyrevoke` `/keyreset` `/keyextend` `/keypause` `/keyresume` `/keynote` `/setgenrole`", inline: false }
+                    { name: "Administrators", value: "`/stats` `/userlookup` `/whois` `/notifyall` `/keyrevoke` `/keyreset` `/keyextend` `/keypause` `/keyresume` `/keynote` `/setgenrole`", inline: false }
                 );
             return interaction.reply({ embeds: [embed], ephemeral: true });
         }
@@ -349,7 +405,7 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.editReply({ embeds: [licenseEmbed(result.license)] });
         }
 
-        if (["keys", "userlookup"].includes(commandName)) {
+        if (["keys", "userlookup", "whois"].includes(commandName)) {
             if (commandName === "keys" ? !hasGeneratorPermission(member) : !isAdministrator(member)) {
                 return interaction.reply({ embeds: [errorEmbed("You do not have permission to search licenses.")], ephemeral: true });
             }
@@ -397,6 +453,15 @@ client.on("interactionCreate", async (interaction) => {
             });
             await sendAudit(commandName === "keyextend" ? "License extended" : "License note updated", interaction, result.message);
             return interaction.editReply({ embeds: [nyxEmbed("License updated", result.message)] });
+        }
+
+        if (commandName === "notifyall") {
+            if (!isAdministrator(member)) return interaction.reply({ embeds: [errorEmbed("Administrator permission is required.")], ephemeral: true });
+            await interaction.deferReply({ ephemeral: true });
+            const message = interaction.options.getString("message");
+            const result = await callAuthApi("/api/bot/notifications", { action: "broadcast", message });
+            await sendAudit("Broadcast announcement", interaction, `Queued ${result.recipients} DM notifications`);
+            return interaction.editReply({ embeds: [nyxEmbed("Announcement queued", `The message will be delivered to **${result.recipients}** accounts with release alerts enabled.`)] });
         }
 
         if (commandName === "mystatus") {
