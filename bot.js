@@ -20,7 +20,14 @@ const CONFIG = {
     AUTH_URL: (process.env.NYX_AUTH_URL || "").replace(/\/+$/, ""),
     API_SECRET: process.env.BOT_API_SECRET,
     AUDIT_LOG_CHANNEL_ID: process.env.AUDIT_LOG_CHANNEL_ID || "",
-    ALLOWED_ROLES_FILE: path.join(__dirname, "allowed_roles.json")
+    // Comma-separated guild IDs the bot is allowed to operate in. Empty means
+    // the bot refuses every command (fail-closed) until a server is added via
+    // ALLOWED_GUILD_IDS or the /owner allow command.
+    ALLOWED_GUILD_IDS: (process.env.ALLOWED_GUILD_IDS || "").split(",").map((value) => value.trim()).filter(Boolean),
+    // Comma-separated Discord user IDs that bypass the allowlist and own the bot.
+    BOT_OWNER_IDS: (process.env.BOT_OWNER_IDS || "").split(",").map((value) => value.trim()).filter(Boolean),
+    ALLOWED_ROLES_FILE: path.join(__dirname, "allowed_roles.json"),
+    ALLOWED_SERVERS_FILE: path.join(__dirname, "allowed_servers.json")
 };
 
 for (const [name, value] of Object.entries({
@@ -35,21 +42,61 @@ for (const [name, value] of Object.entries({
     }
 }
 
-if (!fs.existsSync(CONFIG.ALLOWED_ROLES_FILE)) {
-    fs.writeFileSync(CONFIG.ALLOWED_ROLES_FILE, JSON.stringify([], null, 4));
+// ---------------------------------------------------------------------------
+// Access control
+// ---------------------------------------------------------------------------
+
+// Runtime server allowlist (managed via /owner allow|deny), merged with the
+// static ALLOWED_GUILD_IDS env var so owners can add servers without redeploying.
+let allowedServers = new Set(CONFIG.ALLOWED_GUILD_IDS);
+try {
+    const parsed = JSON.parse(fs.readFileSync(CONFIG.ALLOWED_SERVERS_FILE, "utf8"));
+    if (Array.isArray(parsed)) for (const id of parsed) if (typeof id === "string" && id) allowedServers.add(id);
+} catch { /* first run */ }
+
+function saveAllowedServers() {
+    try {
+        fs.writeFileSync(CONFIG.ALLOWED_SERVERS_FILE, JSON.stringify([...allowedServers], null, 4));
+    } catch (error) {
+        console.error(`[NYX BOT] Could not persist server allowlist: ${error.message}`);
+    }
 }
 
-function loadAllowedRoles() {
+function isAllowedGuild(guildId) {
+    return Boolean(guildId && allowedServers.has(guildId));
+}
+
+function isBotOwner(userId) {
+    return Boolean(userId && CONFIG.BOT_OWNER_IDS.includes(userId));
+}
+
+// Public commands that are safe to run in DMs or non-whitelisted servers.
+const PUBLIC_COMMANDS = new Set(["help", "health", "mystatus"]);
+
+// Per-guild generator roles: { [guildId]: string[] }. Scoped so a role
+// configured in one server cannot grant key generation in another.
+if (!fs.existsSync(CONFIG.ALLOWED_ROLES_FILE)) {
+    fs.writeFileSync(CONFIG.ALLOWED_ROLES_FILE, JSON.stringify({}, null, 4));
+}
+
+function loadAllowedRoles(guildId) {
     try {
         const parsed = JSON.parse(fs.readFileSync(CONFIG.ALLOWED_ROLES_FILE, "utf8"));
-        return Array.isArray(parsed) ? parsed.filter((value) => typeof value === "string") : [];
+        const list = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed[guildId] : undefined;
+        return Array.isArray(list) ? list.filter((value) => typeof value === "string") : [];
     } catch {
         return [];
     }
 }
 
-function saveAllowedRoles(roles) {
-    fs.writeFileSync(CONFIG.ALLOWED_ROLES_FILE, JSON.stringify([...new Set(roles)], null, 4));
+function saveAllowedRoles(guildId, roles) {
+    let store = {};
+    try {
+        const parsed = JSON.parse(fs.readFileSync(CONFIG.ALLOWED_ROLES_FILE, "utf8"));
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) store = parsed;
+    } catch { /* rebuild */ }
+    store[guildId] = [...new Set(roles)];
+    fs.writeFileSync(CONFIG.ALLOWED_ROLES_FILE, JSON.stringify(store, null, 4));
 }
 
 function isAdministrator(member) {
@@ -58,8 +105,33 @@ function isAdministrator(member) {
 
 function hasGeneratorPermission(member) {
     if (isAdministrator(member)) return true;
-    const allowedRoles = loadAllowedRoles();
+    const guildId = member?.guild?.id;
+    if (!guildId) return false;
+    const allowedRoles = loadAllowedRoles(guildId);
     return allowedRoles.length > 0 && member?.roles?.cache?.some((role) => allowedRoles.includes(role.id));
+}
+
+// Simple per-user sliding-window limiter for sensitive commands.
+const commandUsage = new Map();
+
+function checkRateLimit(userId, limit, windowMs) {
+    const now = Date.now();
+    const entry = commandUsage.get(userId) || { timestamps: [] };
+    entry.timestamps = entry.timestamps.filter((time) => now - time < windowMs);
+    if (entry.timestamps.length >= limit) {
+        commandUsage.set(userId, entry);
+        return false;
+    }
+    entry.timestamps.push(now);
+    commandUsage.set(userId, entry);
+    return true;
+}
+
+function logDenied(interaction, reason) {
+    const where = interaction.guild ? `guild=${interaction.guild.id} (${interaction.guild.name})` : "dm";
+    const actor = `${interaction.user.tag} (${interaction.user.id})`;
+    const command = interaction.isChatInputCommand() ? `/${interaction.commandName}` : `button:${interaction.customId}`;
+    console.warn(`[NYX BOT] DENIED ${command} by ${actor} in ${where}: ${reason}`);
 }
 
 function nyxEmbed(title, description = null) {
@@ -289,7 +361,11 @@ const commands = [
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
         .addStringOption((option) => option.setName("key").setDescription("Complete NYX key").setRequired(true))
         .addStringOption((option) => option.setName("note").setDescription("Private note, or blank text to replace it").setRequired(true).setMaxLength(300)),
-    new SlashCommandBuilder().setName("mystatus").setDescription("Check whether your Discord is linked to an active NYX account")
+    new SlashCommandBuilder().setName("mystatus").setDescription("Check whether your Discord is linked to an active NYX account"),
+    new SlashCommandBuilder().setName("owner").setDescription("Manage the server allowlist (owner only)")
+        .addStringOption((option) => option.setName("action").setDescription("Allowlist action").setRequired(true).addChoices(
+            { name: "Allow Server", value: "allow" }, { name: "Deny Server", value: "deny" }, { name: "List Allowed Servers", value: "list" }))
+        .addStringOption((option) => option.setName("serverid").setDescription("Guild ID to allow or deny"))
 ];
 
 client.once("ready", async () => {
@@ -298,10 +374,31 @@ client.once("ready", async () => {
     const rest = new REST({ version: "10" }).setToken(CONFIG.TOKEN);
     await rest.put(Routes.applicationCommands(CONFIG.CLIENT_ID), { body: commands.map((command) => command.toJSON()) });
     console.log(`[NYX BOT] Registered ${commands.length} commands`);
+    console.log(`[NYX BOT] Server allowlist: ${allowedServers.size ? [...allowedServers].join(", ") : "NONE (fail-closed; add via ALLOWED_GUILD_IDS or /owner allow)"}`);
+    console.log(`[NYX BOT] Owners: ${CONFIG.BOT_OWNER_IDS.length ? CONFIG.BOT_OWNER_IDS.join(", ") : "none configured"}`);
+
+    // Leave any server the bot is in that is not on the allowlist.
+    for (const guild of client.guilds.cache.values()) {
+        if (!isAllowedGuild(guild.id)) {
+            console.warn(`[NYX BOT] Leaving non-whitelisted guild ${guild.id} (${guild.name})`);
+            await guild.leave().catch((error) => console.error(`[NYX BOT] Could not leave ${guild.id}: ${error.message}`));
+        }
+    }
+
     await pollNotifications();
     await pollExpiryReminders();
     setInterval(pollNotifications, 60_000).unref();
     setInterval(pollExpiryReminders, 6 * 60 * 60 * 1000).unref();
+});
+
+// Auto-leave if the bot is added to a server that is not on the allowlist.
+client.on("guildCreate", (guild) => {
+    if (isAllowedGuild(guild.id)) {
+        console.log(`[NYX BOT] Added to whitelisted guild ${guild.id} (${guild.name})`);
+        return;
+    }
+    console.warn(`[NYX BOT] Leaving newly-added non-whitelisted guild ${guild.id} (${guild.name})`);
+    guild.leave().catch((error) => console.error(`[NYX BOT] Could not leave ${guild.id}: ${error.message}`));
 });
 
 function confirmationRow(id) {
@@ -313,7 +410,7 @@ function confirmationRow(id) {
 
 async function requestConfirmation(interaction, action, key) {
     const id = crypto.randomUUID();
-    pendingActions.set(id, { action, key, userId: interaction.user.id, expiresAt: Date.now() + 60_000 });
+    pendingActions.set(id, { action, key, userId: interaction.user.id, guildId: interaction.guildId, expiresAt: Date.now() + 60_000 });
     const label = { revoke: "revoke this license", reset: "reset its device", pause: "pause this license", resume: "resume this license" }[action];
     return interaction.reply({
         embeds: [nyxEmbed("Confirm license action", `Are you sure you want to **${label}**?\n\n\`${key.slice(0, 8)}…${key.slice(-8)}\``)],
@@ -325,10 +422,15 @@ async function requestConfirmation(interaction, action, key) {
 async function handleButton(interaction) {
     const [prefix, id] = interaction.customId.split(":");
     if (!id || !["nyx_confirm", "nyx_cancel"].includes(prefix)) return;
+    // Buttons are subject to the same server allowlist as commands.
+    if (interaction.guildId && !isAllowedGuild(interaction.guildId)) {
+        logDenied(interaction, "server not on allowlist");
+        return interaction.reply({ embeds: [errorEmbed("Commands are not enabled in this server.")], ephemeral: true });
+    }
     const pending = pendingActions.get(id);
-    if (!pending || pending.userId !== interaction.user.id || pending.expiresAt < Date.now()) {
+    if (!pending || pending.userId !== interaction.user.id || pending.guildId !== interaction.guildId || pending.expiresAt < Date.now()) {
         pendingActions.delete(id);
-        return interaction.reply({ embeds: [errorEmbed("This confirmation expired. Run the command again.")], ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed("This confirmation expired or is not valid here. Run the command again.")], ephemeral: true });
     }
     pendingActions.delete(id);
     if (prefix === "nyx_cancel") {
@@ -348,6 +450,47 @@ client.on("interactionCreate", async (interaction) => {
         if (interaction.isButton()) return await handleButton(interaction);
         if (!interaction.isChatInputCommand()) return;
         const { commandName, member } = interaction;
+
+        // --- Access gate ---------------------------------------------------
+        // DMs: only public commands. Guilds: only whitelisted servers.
+        if (interaction.guildId) {
+            if (!isAllowedGuild(interaction.guildId)) {
+                logDenied(interaction, "server not on allowlist");
+                return interaction.reply({ embeds: [errorEmbed("Commands are not enabled in this server.")], ephemeral: true });
+            }
+        } else if (!PUBLIC_COMMANDS.has(commandName)) {
+            logDenied(interaction, "sensitive command used in DMs");
+            return interaction.reply({ embeds: [errorEmbed("This command must be used inside an authorized server.")], ephemeral: true });
+        }
+
+        if (commandName === "owner") {
+            if (!isBotOwner(interaction.user.id)) {
+                logDenied(interaction, "not a bot owner");
+                return interaction.reply({ embeds: [errorEmbed("This command is reserved for the bot owner.")], ephemeral: true });
+            }
+            const action = interaction.options.getString("action");
+            if (action === "list") {
+                const list = allowedServers.size ? [...allowedServers].map((id) => `\`${id}\``).join("\n") : "No servers allowed yet.";
+                return interaction.reply({ embeds: [nyxEmbed("Allowed servers", list)], ephemeral: true });
+            }
+            const serverId = interaction.options.getString("serverid")?.trim();
+            if (!serverId || !/^\d{15,20}$/u.test(serverId)) {
+                return interaction.reply({ embeds: [errorEmbed("Enter a valid Discord guild ID.")], ephemeral: true });
+            }
+            if (action === "allow") {
+                allowedServers.add(serverId);
+                saveAllowedServers();
+                return interaction.reply({ embeds: [nyxEmbed("Server allowed", `\`${serverId}\` is now on the allowlist.`)] , ephemeral: true });
+            }
+            if (action === "deny") {
+                allowedServers.delete(serverId);
+                saveAllowedServers();
+                const guild = client.guilds.cache.get(serverId);
+                if (guild) await guild.leave().catch(() => {});
+                return interaction.reply({ embeds: [nyxEmbed("Server denied", `\`${serverId}\` was removed from the allowlist.`)], ephemeral: true });
+            }
+            return interaction.reply({ embeds: [errorEmbed("Unknown owner action.")], ephemeral: true });
+        }
 
         if (commandName === "help") {
             const embed = nyxEmbed("NYX command guide", "Website accounts use a license from this bot, a linked Discord account, and a one-time launch code.")
@@ -370,10 +513,11 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         if (commandName === "setgenrole") {
+            if (!interaction.guildId) return interaction.reply({ embeds: [errorEmbed("This command must be used inside a server.")], ephemeral: true });
             if (!isAdministrator(member)) return interaction.reply({ embeds: [errorEmbed("Administrator permission is required.")], ephemeral: true });
             const action = interaction.options.getString("action");
             const role = interaction.options.getRole("role");
-            let allowedRoles = loadAllowedRoles();
+            let allowedRoles = loadAllowedRoles(interaction.guildId);
             if (action === "list") {
                 const roles = allowedRoles.length ? allowedRoles.map((id) => `<@&${id}>`).join("\n") : "No generator roles configured.";
                 return interaction.reply({ embeds: [nyxEmbed("License generator roles", roles)], ephemeral: true });
@@ -381,13 +525,18 @@ client.on("interactionCreate", async (interaction) => {
             if (!role) return interaction.reply({ embeds: [errorEmbed("Choose a role to add or remove.")], ephemeral: true });
             if (action === "add") allowedRoles.push(role.id);
             if (action === "remove") allowedRoles = allowedRoles.filter((id) => id !== role.id);
-            saveAllowedRoles(allowedRoles);
-            await sendAudit("Generator role updated", interaction, `${action === "add" ? "Added" : "Removed"} ${role.name}`);
+            saveAllowedRoles(interaction.guildId, allowedRoles);
+            await sendAudit("Generator role updated", interaction, `${action === "add" ? "Added" : "Removed"} ${role.name} in ${interaction.guild.name}`);
             return interaction.reply({ embeds: [nyxEmbed("Generator role updated", `${action === "add" ? "Added" : "Removed"} <@&${role.id}>.`)], ephemeral: true });
         }
 
         if (commandName === "keygen") {
             if (!hasGeneratorPermission(member)) return interaction.reply({ embeds: [errorEmbed("You do not have permission to generate licenses.")], ephemeral: true });
+            // Limit key minting to 5 generations per user per minute to stop
+            // accidental or malicious flooding of the license pool.
+            if (!checkRateLimit(interaction.user.id, 5, 60_000)) {
+                return interaction.reply({ embeds: [errorEmbed("Key generation is rate-limited. Try again in a minute.")], ephemeral: true });
+            }
             await interaction.deferReply({ ephemeral: true });
             const duration = interaction.options.getString("duration");
             const amount = interaction.options.getInteger("amount") || 1;
