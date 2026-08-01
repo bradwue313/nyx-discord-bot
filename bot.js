@@ -362,11 +362,36 @@ const commands = [
         .addStringOption((option) => option.setName("key").setDescription("Complete NYX key").setRequired(true))
         .addStringOption((option) => option.setName("note").setDescription("Private note, or blank text to replace it").setRequired(true).setMaxLength(300)),
     new SlashCommandBuilder().setName("mystatus").setDescription("Check whether your Discord is linked to an active NYX account"),
+    new SlashCommandBuilder().setName("redeem").setDescription("Check a license key and get your registration link"),
+    new SlashCommandBuilder().setName("daily").setDescription("Daily license summary (administrators)")
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    new SlashCommandBuilder().setName("status").setDescription("Show live NYX service and license metrics"),
+    new SlashCommandBuilder().setName("giveaway").setDescription("Drop giveaway license keys with a claim button")
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+        .addStringOption((option) => option.setName("duration").setDescription("License duration").setRequired(true).addChoices(...durations))
+        .addIntegerOption((option) => option.setName("count").setDescription("Number of keys, from 1 to 10").setMinValue(1).setMaxValue(10)),
     new SlashCommandBuilder().setName("owner").setDescription("Manage the server allowlist (owner only)")
         .addStringOption((option) => option.setName("action").setDescription("Allowlist action").setRequired(true).addChoices(
             { name: "Allow Server", value: "allow" }, { name: "Deny Server", value: "deny" }, { name: "List Allowed Servers", value: "list" }))
         .addStringOption((option) => option.setName("serverid").setDescription("Guild ID to allow or deny"))
 ];
+
+// Giveaway state: messageId -> { keys: string[], claimed: string[], duration }.
+// Persisted so restarts do not lose unclaimed keys.
+const GIVEAWAY_FILE = path.join(__dirname, "giveaways.json");
+let giveaways = new Map();
+try {
+    const parsed = JSON.parse(fs.readFileSync(GIVEAWAY_FILE, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) giveaways = new Map(Object.entries(parsed));
+} catch { /* first run */ }
+
+function saveGiveaways() {
+    try {
+        fs.writeFileSync(GIVEAWAY_FILE, JSON.stringify(Object.fromEntries(giveaways)));
+    } catch (error) {
+        console.error(`[NYX BOT] Could not persist giveaways: ${error.message}`);
+    }
+}
 
 client.once("ready", async () => {
     console.log(`[NYX BOT] Logged in as ${client.user.tag}`);
@@ -419,14 +444,56 @@ async function requestConfirmation(interaction, action, key) {
     });
 }
 
+async function handleGiveawayClaim(interaction, messageId) {
+    const giveaway = giveaways.get(messageId);
+    if (!giveaway) {
+        return interaction.reply({ embeds: [errorEmbed("This giveaway no longer exists.")], ephemeral: true });
+    }
+    const userId = interaction.user.id;
+    if (giveaway.claimed.includes(userId)) {
+        return interaction.reply({ embeds: [errorEmbed("You already claimed a key from this giveaway.")], ephemeral: true });
+    }
+    const nextKey = giveaway.keys.shift();
+    if (!nextKey) {
+        return interaction.reply({ embeds: [errorEmbed("All giveaway keys have been claimed.")], ephemeral: true });
+    }
+    giveaway.claimed.push(userId);
+    try {
+        await interaction.user.send({ embeds: [nyxEmbed("Your NYX giveaway key", `Your **${giveaway.duration.toUpperCase()}** license:\n\n\`${nextKey}\`\n\nActivate it on the dashboard: ${CONFIG.AUTH_URL}/register?key=${nextKey}`)] });
+    } catch (error) {
+        giveaway.keys.unshift(nextKey);
+        giveaway.claimed.pop();
+        return interaction.reply({ embeds: [errorEmbed("Could not DM you. Enable DMs from server members and try again.")], ephemeral: true });
+    }
+    const remaining = giveaway.keys.length;
+    saveGiveaways();
+    await interaction.reply({ embeds: [nyxEmbed("Key claimed!", `A **${giveaway.duration.toUpperCase()}** license was DM'd to you. ${remaining} key${remaining === 1 ? "" : "s"} left.`)], ephemeral: true });
+    try {
+        const message = await interaction.channel?.messages?.fetch(messageId).catch(() => null);
+        if (message) {
+            await message.edit({
+                embeds: [nyxEmbed("NYX key giveaway", `React below to claim a **${giveaway.duration.toUpperCase()}** license key.\n\n**Remaining: ${remaining}**`)],
+                components: remaining > 0 ? [giveawayRow(messageId)] : []
+            });
+        }
+    } catch { /* message may have been deleted */ }
+}
+
+function giveawayRow(id) {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`nyx_giveaway:${id}`).setLabel("Claim a key").setStyle(ButtonStyle.Primary)
+    );
+}
+
 async function handleButton(interaction) {
     const [prefix, id] = interaction.customId.split(":");
-    if (!id || !["nyx_confirm", "nyx_cancel"].includes(prefix)) return;
+    if (!id || !["nyx_confirm", "nyx_cancel", "nyx_giveaway"].includes(prefix)) return;
     // Buttons are subject to the same server allowlist as commands.
     if (interaction.guildId && !isAllowedGuild(interaction.guildId)) {
         logDenied(interaction, "server not on allowlist");
         return interaction.reply({ embeds: [errorEmbed("Commands are not enabled in this server.")], ephemeral: true });
     }
+    if (prefix === "nyx_giveaway") return handleGiveawayClaim(interaction, id);
     const pending = pendingActions.get(id);
     if (!pending || pending.userId !== interaction.user.id || pending.guildId !== interaction.guildId || pending.expiresAt < Date.now()) {
         pendingActions.delete(id);
@@ -613,17 +680,112 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.editReply({ embeds: [nyxEmbed("Announcement queued", `The message will be delivered to **${result.recipients}** accounts with release alerts enabled.`)] });
         }
 
+        if (commandName === "redeem") {
+            await interaction.deferReply({ ephemeral: true });
+            const result = await callAuthApi("/api/bot/keys", { action: "validate", key: interaction.options.getString("key").trim() });
+            if (!result.redeemable) {
+                const reason = result.reason === "already_claimed" ? "This key is already attached to an account. Sign in on the dashboard to view it." : "This key is revoked or invalid.";
+                return interaction.editReply({ embeds: [nyxEmbed("Key is not redeemable", reason)] });
+            }
+            const license = result.license;
+            const expires = license.duration === "lifetime" ? "Lifetime" : formatTimestamp(license.expiresAt);
+            return interaction.editReply({ embeds: [nyxEmbed("License ready to activate", `Key \`${license.keyPreview}\` is valid and unclaimed.\n\n**Duration:** ${license.duration.toUpperCase()}\n**Expires:** ${expires}\n\nActivate it here: ${CONFIG.AUTH_URL}/register?key=${encodeURIComponent(interaction.options.getString("key").trim())}`)] });
+        }
+
+        if (commandName === "daily") {
+            if (!isAdministrator(member)) return interaction.reply({ embeds: [errorEmbed("Administrator permission is required.")], ephemeral: true });
+            await interaction.deferReply({ ephemeral: true });
+            const [statsResult, expiringResult] = await Promise.all([
+                callAuthApi("/api/bot/keys", { action: "stats", actorId: interaction.user.id }),
+                callAuthApi("/api/bot/expiring", { windowSeconds: 72 * 60 * 60 }).catch(() => ({ expiring: [] }))
+            ]);
+            const stats = statsResult.stats;
+            const expiringSoon = expiringResult.expiring.slice(0, 8);
+            const embed = nyxEmbed("Daily NYX summary", `Snapshot at ${formatTimestamp(Math.floor(Date.now() / 1000))}`)
+                .addFields(
+                    { name: "Total licenses", value: String(stats.total), inline: true },
+                    { name: "Active", value: String(stats.active), inline: true },
+                    { name: "Unused", value: String(stats.unused), inline: true },
+                    { name: "Paused", value: String(stats.paused), inline: true },
+                    { name: "Expired", value: String(stats.expired), inline: true },
+                    { name: "Revoked", value: String(stats.revoked), inline: true }
+                );
+            if (expiringSoon.length) {
+                embed.addFields({ name: "Expiring within 72h", value: expiringSoon.map((entry) => `\`${entry.keyPreview ?? entry.username}\` — ${formatTimestamp(entry.expiresAt)}`).join("\n") });
+            }
+            return interaction.editReply({ embeds: [embed] });
+        }
+
+        if (commandName === "status") {
+            await interaction.deferReply({ ephemeral: true });
+            const [snapshot, metrics] = await Promise.all([
+                fetch(`${CONFIG.AUTH_URL}/api/status`, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(12_000) }).then((r) => r.json()).catch(() => null),
+                callAuthApi("/api/metrics", {}).catch(() => null)
+            ]);
+            if (!snapshot || !metrics) return interaction.editReply({ embeds: [errorEmbed("The NYX website is waking up or did not respond. Try again in a moment.")] });
+            const serviceLines = (snapshot.services || []).map((service) => `**${service.label}** — ${service.status.toUpperCase()}`).join("\n");
+            const embed = nyxEmbed("NYX live status")
+                .addFields(
+                    { name: "Overall", value: snapshot.status === "operational" ? "OPERATIONAL" : "MAINTENANCE", inline: true },
+                    { name: "Checked", value: `<t:${snapshot.checkedAt}:R>`, inline: true }
+                )
+                .addFields({ name: "Services", value: serviceLines || "No services reported" })
+                .addFields(
+                    { name: "Active licenses", value: String(metrics.metrics?.licenses?.active ?? 0), inline: true },
+                    { name: "Unused keys", value: String(metrics.metrics?.licenses?.unused ?? 0), inline: true },
+                    { name: "Live sessions", value: String(metrics.metrics?.active_sessions ?? 0), inline: true },
+                    { name: "Pending DMs", value: String(metrics.metrics?.pending_notifications ?? 0), inline: true },
+                    { name: "Latest build", value: snapshot.metrics?.clientVersion ? `v${snapshot.metrics.clientVersion}` : "Unknown", inline: true }
+                );
+            return interaction.editReply({ embeds: [embed] });
+        }
+
+        if (commandName === "giveaway") {
+            if (!isAdministrator(member)) return interaction.reply({ embeds: [errorEmbed("Administrator permission is required.")], ephemeral: true });
+            await interaction.deferReply({ ephemeral: true });
+            const duration = interaction.options.getString("duration");
+            const count = interaction.options.getInteger("count") || 1;
+            const result = await callAuthApi("/api/bot/keys", { action: "generate", duration, amount: count, createdBy: interaction.user.tag, actorId: interaction.user.id });
+            const message = await interaction.editReply({
+                embeds: [nyxEmbed("NYX key giveaway", `Claim a **${duration.toUpperCase()}** license key below. **${result.keys.length}** available — first come, first served. Keys are delivered by DM.`)],
+                components: [giveawayRow("pending")]
+            });
+            // Re-post with a real message id so claim buttons can find the embed.
+            await message.delete().catch(() => {});
+            const posted = await interaction.channel.send({
+                embeds: [nyxEmbed("NYX key giveaway", `Claim a **${duration.toUpperCase()}** license key below. **${result.keys.length}** available — first come, first served. Keys are delivered by DM.`)],
+                components: [giveawayRow("pending")]
+            });
+            giveaways.set(posted.id, { keys: result.keys, claimed: [], duration });
+            saveGiveaways();
+            await posted.edit({ components: [giveawayRow(posted.id)] });
+            await sendAudit("Giveaway started", interaction, `${result.keys.length} × ${duration}`);
+            return interaction.followUp({ embeds: [nyxEmbed("Giveaway posted", `Giveaway started with **${result.keys.length}** keys. Claim button is live in this channel.`)], ephemeral: true });
+        }
+
         if (commandName === "mystatus") {
             await interaction.deferReply({ ephemeral: true });
             const result = await callAuthApi("/api/bot/status", { discordId: interaction.user.id });
             if (!result.linked) return interaction.editReply({ embeds: [nyxEmbed("Discord not linked", "Sign in to the NYX website dashboard and choose **Connect Discord**.")] });
             const account = result.account;
+            const launchReadiness = result.active
+                ? account.deviceId
+                    ? "READY TO LAUNCH"
+                    : "Launch blocked — no device bound. Launch NYX once to bind your hardware."
+                : {
+                    revoked: "Launch blocked — your license was revoked.",
+                    paused: "Launch blocked — your license is paused.",
+                    expired: "Launch blocked — your license has expired.",
+                    device_unbound: "Launch blocked — no device bound.",
+                    not_linked: "Launch blocked — Discord is not linked."
+                }[result.reason] || "Launch blocked — see the dashboard.";
             return interaction.editReply({ embeds: [nyxEmbed("Your NYX account").addFields(
                 { name: "Website account", value: account.username, inline: true },
                 { name: "License", value: result.active ? "ACTIVE" : account.pausedAt ? "PAUSED" : "INACTIVE", inline: true },
                 { name: "Plan", value: account.duration.toUpperCase(), inline: true },
                 { name: "Expires", value: account.duration === "lifetime" ? "Lifetime" : formatTimestamp(account.expiresAt), inline: true },
                 { name: "Device", value: account.deviceId ? "Bound" : "Not bound", inline: true },
+                { name: "Launch readiness", value: launchReadiness, inline: false },
                 { name: "Dashboard", value: CONFIG.AUTH_URL, inline: false }
             )] });
         }
