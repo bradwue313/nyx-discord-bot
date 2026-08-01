@@ -27,7 +27,16 @@ const CONFIG = {
     // Comma-separated Discord user IDs that bypass the allowlist and own the bot.
     BOT_OWNER_IDS: (process.env.BOT_OWNER_IDS || "").split(",").map((value) => value.trim()).filter(Boolean),
     ALLOWED_ROLES_FILE: path.join(__dirname, "allowed_roles.json"),
-    ALLOWED_SERVERS_FILE: path.join(__dirname, "allowed_servers.json")
+    ALLOWED_SERVERS_FILE: path.join(__dirname, "allowed_servers.json"),
+    // Giveaway tuning: hard cap on keys per giveaway, per-guild cooldown in
+    // minutes between giveaways, and an optional scheduled auto-giveaway that
+    // posts to GIVEAWAY_CHANNEL_ID every GIVEAWAY_AUTO_INTERVAL_HOURS hours.
+    GIVEAWAY_MAX_KEYS: Math.max(1, Math.min(25, Number(process.env.GIVEAWAY_MAX_KEYS) || 10)),
+    GIVEAWAY_COOLDOWN_MINUTES: Math.max(0, Number(process.env.GIVEAWAY_COOLDOWN_MINUTES) || 0),
+    GIVEAWAY_CHANNEL_ID: process.env.GIVEAWAY_CHANNEL_ID || "",
+    GIVEAWAY_AUTO_INTERVAL_HOURS: Math.max(0, Number(process.env.GIVEAWAY_AUTO_INTERVAL_HOURS) || 0),
+    GIVEAWAY_AUTO_DURATION: process.env.GIVEAWAY_AUTO_DURATION || "1w",
+    GIVEAWAY_AUTO_COUNT: Math.max(1, Math.min(25, Number(process.env.GIVEAWAY_AUTO_COUNT) || 3))
 };
 
 for (const [name, value] of Object.entries({
@@ -393,6 +402,22 @@ function saveGiveaways() {
     }
 }
 
+// Last giveaway start time per guild, so a per-server cooldown survives restarts.
+const GIVEAWAY_COOLDOWN_FILE = path.join(__dirname, "giveaway_cooldowns.json");
+let lastGiveawayAt = {};
+try {
+    const parsed = JSON.parse(fs.readFileSync(GIVEAWAY_COOLDOWN_FILE, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) lastGiveawayAt = parsed;
+} catch { /* first run */ }
+
+function saveGiveawayCooldowns() {
+    try {
+        fs.writeFileSync(GIVEAWAY_COOLDOWN_FILE, JSON.stringify(lastGiveawayAt));
+    } catch (error) {
+        console.error(`[NYX BOT] Could not persist giveaway cooldowns: ${error.message}`);
+    }
+}
+
 client.once("ready", async () => {
     console.log(`[NYX BOT] Logged in as ${client.user.tag}`);
     client.user.setPresence({ activities: [{ name: "NYX authorization" }], status: "online" });
@@ -414,6 +439,35 @@ client.once("ready", async () => {
     await pollExpiryReminders();
     setInterval(pollNotifications, 60_000).unref();
     setInterval(pollExpiryReminders, 6 * 60 * 60 * 1000).unref();
+
+    // Scheduled auto-giveaway: posts a fresh giveaway to the designated
+    // channel every GIVEAWAY_AUTO_INTERVAL_HOURS while the bot is running.
+    if (CONFIG.GIVEAWAY_CHANNEL_ID && CONFIG.GIVEAWAY_AUTO_INTERVAL_HOURS > 0) {
+        const intervalMs = CONFIG.GIVEAWAY_AUTO_INTERVAL_HOURS * 60 * 60 * 1000;
+        console.log(`[NYX BOT] Auto-giveaway scheduled every ${CONFIG.GIVEAWAY_AUTO_INTERVAL_HOURS}h in channel ${CONFIG.GIVEAWAY_CHANNEL_ID}`);
+        setInterval(async () => {
+            if (!client.isReady()) return;
+            try {
+                const channel = await client.channels.fetch(CONFIG.GIVEAWAY_CHANNEL_ID).catch(() => null);
+                if (!channel?.isTextBased()) {
+                    console.error(`[NYX BOT] Auto-giveaway channel ${CONFIG.GIVEAWAY_CHANNEL_ID} is not available`);
+                    return;
+                }
+                const count = CONFIG.GIVEAWAY_AUTO_COUNT;
+                const result = await callAuthApi("/api/bot/keys", { action: "generate", duration: CONFIG.GIVEAWAY_AUTO_DURATION, amount: count, createdBy: "auto-giveaway", actorId: "auto-giveaway" });
+                const message = await channel.send({
+                    embeds: [nyxEmbed("NYX key giveaway", `Claim a **${CONFIG.GIVEAWAY_AUTO_DURATION.toUpperCase()}** license key below. **${result.keys.length}** available — first come, first served. Keys are delivered by DM.`)],
+                    components: [giveawayRow("pending")]
+                });
+                giveaways.set(message.id, { keys: result.keys, claimed: [], duration: CONFIG.GIVEAWAY_AUTO_DURATION });
+                saveGiveaways();
+                await message.edit({ components: [giveawayRow(message.id)] });
+                console.log(`[NYX BOT] Auto-giveaway posted ${result.keys.length} × ${CONFIG.GIVEAWAY_AUTO_DURATION} in ${CONFIG.GIVEAWAY_CHANNEL_ID}`);
+            } catch (error) {
+                console.error(`[NYX BOT] Auto-giveaway failed: ${error.message}`);
+            }
+        }, intervalMs).unref();
+    }
 });
 
 // Auto-leave if the bot is added to a server that is not on the allowlist.
@@ -742,10 +796,25 @@ client.on("interactionCreate", async (interaction) => {
 
         if (commandName === "giveaway") {
             if (!isAdministrator(member)) return interaction.reply({ embeds: [errorEmbed("Administrator permission is required.")], ephemeral: true });
+            if (interaction.guildId && CONFIG.GIVEAWAY_COOLDOWN_MINUTES > 0) {
+                const lastAt = Number(lastGiveawayAt[interaction.guildId] || 0);
+                const elapsedMs = Date.now() - lastAt;
+                const cooldownMs = CONFIG.GIVEAWAY_COOLDOWN_MINUTES * 60_000;
+                if (lastAt && elapsedMs < cooldownMs) {
+                    const waitMinutes = Math.ceil((cooldownMs - elapsedMs) / 60_000);
+                    return interaction.reply({ embeds: [errorEmbed(`Giveaways are on cooldown in this server. Try again in **${waitMinutes} minute${waitMinutes === 1 ? "" : "s"}**.`)], ephemeral: true });
+                }
+            }
             await interaction.deferReply({ ephemeral: true });
             const duration = interaction.options.getString("duration");
-            const count = interaction.options.getInteger("count") || 1;
+            let count = interaction.options.getInteger("count") || 1;
+            const capped = count > CONFIG.GIVEAWAY_MAX_KEYS;
+            count = Math.min(count, CONFIG.GIVEAWAY_MAX_KEYS);
             const result = await callAuthApi("/api/bot/keys", { action: "generate", duration, amount: count, createdBy: interaction.user.tag, actorId: interaction.user.id });
+            // Record the cooldown only after generation succeeds, so a failed
+            // giveaway (website down, maintenance) does not burn the server's window.
+            lastGiveawayAt[interaction.guildId] = Date.now();
+            saveGiveawayCooldowns();
             const message = await interaction.editReply({
                 embeds: [nyxEmbed("NYX key giveaway", `Claim a **${duration.toUpperCase()}** license key below. **${result.keys.length}** available — first come, first served. Keys are delivered by DM.`)],
                 components: [giveawayRow("pending")]
@@ -760,7 +829,9 @@ client.on("interactionCreate", async (interaction) => {
             saveGiveaways();
             await posted.edit({ components: [giveawayRow(posted.id)] });
             await sendAudit("Giveaway started", interaction, `${result.keys.length} × ${duration}`);
-            return interaction.followUp({ embeds: [nyxEmbed("Giveaway posted", `Giveaway started with **${result.keys.length}** keys. Claim button is live in this channel.`)], ephemeral: true });
+            const followUpText = `Giveaway started with **${result.keys.length}** key${result.keys.length === 1 ? "" : "s"}. Claim button is live in this channel.`
+                + (capped ? ` (Requested ${interaction.options.getInteger("count")} — capped at the server max of ${CONFIG.GIVEAWAY_MAX_KEYS}.)` : "");
+            return interaction.followUp({ embeds: [nyxEmbed("Giveaway posted", followUpText)], ephemeral: true });
         }
 
         if (commandName === "mystatus") {
