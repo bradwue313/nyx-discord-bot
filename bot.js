@@ -80,7 +80,7 @@ function isBotOwner(userId) {
 }
 
 // Public commands that are safe to run in DMs or non-whitelisted servers.
-const PUBLIC_COMMANDS = new Set(["help", "health", "mystatus"]);
+const PUBLIC_COMMANDS = new Set(["help", "health", "mystatus", "download", "link"]);
 
 // Per-guild generator roles: { [guildId]: string[] }. Scoped so a role
 // configured in one server cannot grant key generation in another.
@@ -242,6 +242,59 @@ async function sendAudit(title, interaction, details) {
 }
 
 let notificationPollActive = false;
+let securityAlertPollActive = false;
+
+// Near-real-time crack/sharing alerts: polls the website's security_alerts
+// queue and posts each one to the audit channel and every configured owner DM.
+async function pollSecurityAlerts() {
+    if (securityAlertPollActive || !client.isReady()) return;
+    securityAlertPollActive = true;
+    try {
+        const { alerts = [] } = await callAuthApi("/api/bot/alerts", { action: "poll" });
+        const acked = [];
+        for (const alert of alerts) {
+            const title = {
+                device_ban: "HWID banned",
+                device_unban: "HWID ban lifted",
+                token_replay: "Refresh-token replay",
+                sharing: "License sharing detected"
+            }[alert.kind] || "Security alert";
+            const embed = nyxEmbed(`⚠️ ${title}`, alert.message)
+                .addFields({ name: "Time", value: `<t:${Math.floor(Number(alert.createdAt))}:F>`, inline: false });
+            if (alert.details) {
+                try {
+                    const parsed = JSON.parse(alert.details);
+                    const lines = Object.entries(parsed).map(([key, value]) => `**${key}:** \`${value}\``).join("\n");
+                    if (lines) embed.addFields({ name: "Details", value: lines.slice(0, 1000), inline: false });
+                } catch { /* ignore malformed details */ }
+            }
+            if (CONFIG.AUDIT_LOG_CHANNEL_ID) {
+                try {
+                    const channel = await client.channels.fetch(CONFIG.AUDIT_LOG_CHANNEL_ID);
+                    if (channel?.isTextBased()) await channel.send({ embeds: [embed] });
+                } catch (error) {
+                    console.error(`[NYX BOT] Could not post security alert to audit channel: ${error.message}`);
+                }
+            }
+            for (const ownerId of CONFIG.BOT_OWNER_IDS) {
+                try {
+                    const owner = await client.users.fetch(ownerId);
+                    await owner.send({ embeds: [embed] });
+                } catch (error) {
+                    console.error(`[NYX BOT] Could not DM owner ${ownerId}: ${error.message}`);
+                }
+            }
+            acked.push(alert.id);
+        }
+        if (acked.length) {
+            await callAuthApi("/api/bot/alerts", { action: "ack", ids: acked });
+        }
+    } catch (error) {
+        console.error(`[NYX BOT] Security alert poll failed: ${error.message}`);
+    } finally {
+        securityAlertPollActive = false;
+    }
+}
 
 // Licenses whose expiry has already been announced, keyed by license id.
 // Persisted so restarts do not re-announce the same expirations.
@@ -351,6 +404,10 @@ const commands = [
     new SlashCommandBuilder().setName("notifyall").setDescription("Send an announcement DM to every account with release alerts enabled")
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
         .addStringOption((option) => option.setName("message").setDescription("Announcement text").setRequired(true).setMaxLength(500)),
+    new SlashCommandBuilder().setName("notifyuser").setDescription("Queue a DM notification for a linked Discord user")
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+        .addStringOption((option) => option.setName("userid").setDescription("Discord user ID").setRequired(true))
+        .addStringOption((option) => option.setName("message").setDescription("Notification text").setRequired(true).setMaxLength(500)),
     new SlashCommandBuilder().setName("stats").setDescription("Show live NYX license totals")
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
     new SlashCommandBuilder().setName("health").setDescription("Check the NYX website and authorization service"),
@@ -371,7 +428,10 @@ const commands = [
         .addStringOption((option) => option.setName("key").setDescription("Complete NYX key").setRequired(true))
         .addStringOption((option) => option.setName("note").setDescription("Private note, or blank text to replace it").setRequired(true).setMaxLength(300)),
     new SlashCommandBuilder().setName("mystatus").setDescription("Check whether your Discord is linked to an active NYX account"),
-    new SlashCommandBuilder().setName("redeem").setDescription("Check a license key and get your registration link"),
+    new SlashCommandBuilder().setName("redeem").setDescription("Check a license key and get your registration link")
+        .addStringOption((option) => option.setName("key").setDescription("Complete NYX license key").setRequired(true)),
+    new SlashCommandBuilder().setName("download").setDescription("Get the NYX client download link and latest version"),
+    new SlashCommandBuilder().setName("link").setDescription("Learn how to link your Discord account to NYX"),
     new SlashCommandBuilder().setName("daily").setDescription("Daily license summary (administrators)")
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
     new SlashCommandBuilder().setName("status").setDescription("Show live NYX service and license metrics"),
@@ -388,13 +448,19 @@ const commands = [
 // Giveaway state: messageId -> { keys: string[], claimed: string[], duration }.
 // Persisted so restarts do not lose unclaimed keys.
 const GIVEAWAY_FILE = path.join(__dirname, "giveaways.json");
+const GIVEAWAY_COOLDOWN_FILE = path.join(__dirname, "giveaway_cooldowns.json");
 let giveaways = new Map();
+let lastGiveawayAt = {};
 try {
     const parsed = JSON.parse(fs.readFileSync(GIVEAWAY_FILE, "utf8"));
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) giveaways = new Map(Object.entries(parsed));
 } catch { /* first run */ }
+try {
+    const parsed = JSON.parse(fs.readFileSync(GIVEAWAY_COOLDOWN_FILE, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) lastGiveawayAt = parsed;
+} catch { /* first run */ }
 
-function saveGiveaways() {
+function saveGiveawaysLocal() {
     try {
         fs.writeFileSync(GIVEAWAY_FILE, JSON.stringify(Object.fromEntries(giveaways)));
     } catch (error) {
@@ -402,20 +468,58 @@ function saveGiveaways() {
     }
 }
 
-// Last giveaway start time per guild, so a per-server cooldown survives restarts.
-const GIVEAWAY_COOLDOWN_FILE = path.join(__dirname, "giveaway_cooldowns.json");
-let lastGiveawayAt = {};
-try {
-    const parsed = JSON.parse(fs.readFileSync(GIVEAWAY_COOLDOWN_FILE, "utf8"));
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) lastGiveawayAt = parsed;
-} catch { /* first run */ }
-
-function saveGiveawayCooldowns() {
+function saveGiveawayCooldownsLocal() {
     try {
         fs.writeFileSync(GIVEAWAY_COOLDOWN_FILE, JSON.stringify(lastGiveawayAt));
     } catch (error) {
         console.error(`[NYX BOT] Could not persist giveaway cooldowns: ${error.message}`);
     }
+}
+
+async function loadGiveawayStateFromWebsite() {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+    try {
+        const response = await fetch(`${CONFIG.AUTH_URL}/api/bot/giveaways`, {
+            headers: {
+                Authorization: `Bearer ${CONFIG.API_SECRET}`,
+                Accept: "application/json"
+            },
+            signal: controller.signal
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload.success) return;
+        if (payload.giveaways && typeof payload.giveaways === "object" && !Array.isArray(payload.giveaways)) {
+            giveaways = new Map(Object.entries(payload.giveaways));
+        }
+        if (payload.cooldowns && typeof payload.cooldowns === "object" && !Array.isArray(payload.cooldowns)) {
+            lastGiveawayAt = payload.cooldowns;
+        }
+    } catch (error) {
+        console.error(`[NYX BOT] Could not load giveaways from website: ${error.message}`);
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+async function persistGiveawayState() {
+    const payload = { giveaways: Object.fromEntries(giveaways), cooldowns: lastGiveawayAt };
+    try {
+        await callAuthApi("/api/bot/giveaways", payload);
+        return;
+    } catch (error) {
+        console.error(`[NYX BOT] Could not sync giveaways to website: ${error.message}`);
+    }
+    saveGiveawaysLocal();
+    saveGiveawayCooldownsLocal();
+}
+
+function saveGiveaways() {
+    persistGiveawayState();
+}
+
+function saveGiveawayCooldowns() {
+    persistGiveawayState();
 }
 
 client.once("ready", async () => {
@@ -427,6 +531,8 @@ client.once("ready", async () => {
     console.log(`[NYX BOT] Server allowlist: ${allowedServers.size ? [...allowedServers].join(", ") : "NONE (fail-closed; add via ALLOWED_GUILD_IDS or /owner allow)"}`);
     console.log(`[NYX BOT] Owners: ${CONFIG.BOT_OWNER_IDS.length ? CONFIG.BOT_OWNER_IDS.join(", ") : "none configured"}`);
 
+    await loadGiveawayStateFromWebsite();
+
     // Leave any server the bot is in that is not on the allowlist.
     for (const guild of client.guilds.cache.values()) {
         if (!isAllowedGuild(guild.id)) {
@@ -437,8 +543,11 @@ client.once("ready", async () => {
 
     await pollNotifications();
     await pollExpiryReminders();
+    await pollSecurityAlerts();
     setInterval(pollNotifications, 60_000).unref();
     setInterval(pollExpiryReminders, 6 * 60 * 60 * 1000).unref();
+    // Crack alerts are time-sensitive — poll every 15 seconds.
+    setInterval(pollSecurityAlerts, 15_000).unref();
 
     // Scheduled auto-giveaway: posts a fresh giveaway to the designated
     // channel every GIVEAWAY_AUTO_INTERVAL_HOURS while the bot is running.
@@ -616,9 +725,10 @@ client.on("interactionCreate", async (interaction) => {
         if (commandName === "help") {
             const embed = nyxEmbed("NYX command guide", "Website accounts use a license from this bot, a linked Discord account, and a one-time launch code.")
                 .addFields(
-                    { name: "Account", value: "`/mystatus` — check your linked account\n`/health` — check service availability", inline: false },
-                    { name: "License team", value: "`/keygen` `/keyinfo` `/keys`", inline: false },
-                    { name: "Administrators", value: "`/stats` `/userlookup` `/whois` `/notifyall` `/keyrevoke` `/keyreset` `/keyextend` `/keypause` `/keyresume` `/keynote` `/setgenrole`", inline: false }
+                    { name: "Account", value: "`/help` — this guide\n`/health` — service availability\n`/mystatus` — linked account status\n`/redeem` — validate a key and get your registration link\n`/download` — client download link and latest version\n`/link` — how to connect Discord", inline: false },
+                    { name: "License team", value: "`/keygen` `/keyinfo` `/keys` `/setgenrole`", inline: false },
+                    { name: "Administrators", value: "`/stats` `/daily` `/status` `/userlookup` `/whois` `/notifyall` `/notifyuser` `/giveaway` `/keyrevoke` `/keyreset` `/keyextend` `/keypause` `/keyresume` `/keynote`", inline: false },
+                    { name: "Owner", value: "`/owner` — manage the server allowlist", inline: false }
                 );
             return interaction.reply({ embeds: [embed], ephemeral: true });
         }
@@ -732,6 +842,39 @@ client.on("interactionCreate", async (interaction) => {
             const result = await callAuthApi("/api/bot/notifications", { action: "broadcast", message });
             await sendAudit("Broadcast announcement", interaction, `Queued ${result.recipients} DM notifications`);
             return interaction.editReply({ embeds: [nyxEmbed("Announcement queued", `The message will be delivered to **${result.recipients}** accounts with release alerts enabled.`)] });
+        }
+
+        if (commandName === "notifyuser") {
+            if (!isAdministrator(member)) return interaction.reply({ embeds: [errorEmbed("Administrator permission is required.")], ephemeral: true });
+            await interaction.deferReply({ ephemeral: true });
+            const discordId = interaction.options.getString("userid").trim();
+            const message = interaction.options.getString("message");
+            if (!/^\d{15,20}$/u.test(discordId)) {
+                return interaction.editReply({ embeds: [errorEmbed("Enter a valid Discord user ID.")] });
+            }
+            await callAuthApi("/api/bot/notifications", { action: "direct", discordId, message });
+            await sendAudit("Direct notification", interaction, `Queued DM for ${discordId}`);
+            return interaction.editReply({ embeds: [nyxEmbed("Notification queued", `A DM will be delivered to <@${discordId}> via the website notification queue.`)] });
+        }
+
+        if (commandName === "download") {
+            await interaction.deferReply({ ephemeral: true });
+            const snapshot = await fetch(`${CONFIG.AUTH_URL}/api/status`, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(12_000) })
+                .then((response) => response.json())
+                .catch(() => null);
+            const version = snapshot?.metrics?.clientVersion;
+            return interaction.editReply({ embeds: [nyxEmbed("Download NYX client").addFields(
+                { name: "Latest version", value: version ? `v${version}` : "Unknown", inline: true },
+                { name: "Download", value: `${CONFIG.AUTH_URL}/download`, inline: false }
+            )] });
+        }
+
+        if (commandName === "link") {
+            return interaction.reply({
+                embeds: [nyxEmbed("Link your Discord account", "NYX uses your Discord account for license verification and launch codes.\n\n1. Sign in at the NYX dashboard\n2. Click **Connect Discord**\n3. Authorize the NYX application\n\nOnce linked, use `/mystatus` to verify your account.")
+                    .addFields({ name: "Dashboard", value: `${CONFIG.AUTH_URL}/dashboard`, inline: false })],
+                ephemeral: true
+            });
         }
 
         if (commandName === "redeem") {
@@ -857,6 +1000,7 @@ client.on("interactionCreate", async (interaction) => {
                 { name: "Expires", value: account.duration === "lifetime" ? "Lifetime" : formatTimestamp(account.expiresAt), inline: true },
                 { name: "Device", value: account.deviceId ? "Bound" : "Not bound", inline: true },
                 { name: "Launch readiness", value: launchReadiness, inline: false },
+                ...(account.deviceId ? [{ name: "Device reset", value: `To reset your hardware binding, visit [Account settings](${CONFIG.AUTH_URL}/settings).`, inline: false }] : []),
                 { name: "Dashboard", value: CONFIG.AUTH_URL, inline: false }
             )] });
         }
