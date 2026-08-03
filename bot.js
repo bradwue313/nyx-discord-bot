@@ -2,6 +2,7 @@ const {
     ActionRowBuilder,
     ButtonBuilder,
     ButtonStyle,
+    ChannelType,
     Client,
     EmbedBuilder,
     GatewayIntentBits,
@@ -36,7 +37,11 @@ const CONFIG = {
     GIVEAWAY_CHANNEL_ID: process.env.GIVEAWAY_CHANNEL_ID || "",
     GIVEAWAY_AUTO_INTERVAL_HOURS: Math.max(0, Number(process.env.GIVEAWAY_AUTO_INTERVAL_HOURS) || 0),
     GIVEAWAY_AUTO_DURATION: process.env.GIVEAWAY_AUTO_DURATION || "1w",
-    GIVEAWAY_AUTO_COUNT: Math.max(1, Math.min(25, Number(process.env.GIVEAWAY_AUTO_COUNT) || 3))
+    GIVEAWAY_AUTO_COUNT: Math.max(1, Math.min(25, Number(process.env.GIVEAWAY_AUTO_COUNT) || 3)),
+    // Optional support ticket category and scheduled daily digest channel.
+    TICKET_CATEGORY_ID: process.env.TICKET_CATEGORY_ID || "",
+    DIGEST_CHANNEL_ID: process.env.DIGEST_CHANNEL_ID || "",
+    DIGEST_INTERVAL_HOURS: Math.max(0, Number(process.env.DIGEST_INTERVAL_HOURS) || 0)
 };
 
 for (const [name, value] of Object.entries({
@@ -241,6 +246,48 @@ async function sendAudit(title, interaction, details) {
     }
 }
 
+// Shared daily / digest snapshot used by /daily, /digest, and the scheduled poster.
+async function buildDailySummaryEmbed(actorId = "system") {
+    const [statsResult, expiringResult] = await Promise.all([
+        callAuthApi("/api/bot/keys", { action: "stats", actorId }),
+        callAuthApi("/api/bot/expiring", { windowSeconds: 72 * 60 * 60 }).catch(() => ({ expiring: [] }))
+    ]);
+    const stats = statsResult.stats;
+    const expiringSoon = (expiringResult.expiring || []).slice(0, 8);
+    const embed = nyxEmbed("Daily NYX summary", `Snapshot at ${formatTimestamp(Math.floor(Date.now() / 1000))}`)
+        .addFields(
+            { name: "Total licenses", value: String(stats.total), inline: true },
+            { name: "Active", value: String(stats.active), inline: true },
+            { name: "Unused", value: String(stats.unused), inline: true },
+            { name: "Paused", value: String(stats.paused), inline: true },
+            { name: "Expired", value: String(stats.expired), inline: true },
+            { name: "Revoked", value: String(stats.revoked), inline: true }
+        );
+    if (expiringSoon.length) {
+        embed.addFields({
+            name: "Expiring within 72h",
+            value: expiringSoon.map((entry) => `\`${entry.keyPreview ?? entry.username}\` — ${formatTimestamp(entry.expiresAt)}`).join("\n")
+        });
+    }
+    return embed;
+}
+
+function ticketChannelName(username) {
+    const slug = String(username || "user")
+        .toLowerCase()
+        .replace(/[^a-z0-9-_]/gu, "")
+        .replace(/-+/gu, "-")
+        .replace(/^-+|-+$/gu, "")
+        .slice(0, 80) || "user";
+    return `ticket-${slug}`.slice(0, 100);
+}
+
+function ticketCloseRow(openerId) {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`nyx_ticket_close:${openerId}`).setLabel("Close ticket").setStyle(ButtonStyle.Danger)
+    );
+}
+
 let notificationPollActive = false;
 let securityAlertPollActive = false;
 
@@ -434,6 +481,10 @@ const commands = [
     new SlashCommandBuilder().setName("link").setDescription("Learn how to link your Discord account to NYX"),
     new SlashCommandBuilder().setName("daily").setDescription("Daily license summary (administrators)")
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    new SlashCommandBuilder().setName("digest").setDescription("Post or view the daily license digest (administrators)")
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+        .addBooleanOption((option) => option.setName("public").setDescription("Also post the digest to DIGEST_CHANNEL_ID")),
+    new SlashCommandBuilder().setName("ticket").setDescription("Open a private support ticket channel"),
     new SlashCommandBuilder().setName("status").setDescription("Show live NYX service and license metrics"),
     new SlashCommandBuilder().setName("giveaway").setDescription("Drop giveaway license keys with a claim button")
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
@@ -577,6 +628,28 @@ client.once("ready", async () => {
             }
         }, intervalMs).unref();
     }
+
+    // Scheduled digest: posts the daily-style summary to DIGEST_CHANNEL_ID
+    // every DIGEST_INTERVAL_HOURS while the bot is running.
+    if (CONFIG.DIGEST_CHANNEL_ID && CONFIG.DIGEST_INTERVAL_HOURS > 0) {
+        const digestIntervalMs = CONFIG.DIGEST_INTERVAL_HOURS * 60 * 60 * 1000;
+        console.log(`[NYX BOT] Digest scheduled every ${CONFIG.DIGEST_INTERVAL_HOURS}h in channel ${CONFIG.DIGEST_CHANNEL_ID}`);
+        setInterval(async () => {
+            if (!client.isReady()) return;
+            try {
+                const channel = await client.channels.fetch(CONFIG.DIGEST_CHANNEL_ID).catch(() => null);
+                if (!channel?.isTextBased()) {
+                    console.error(`[NYX BOT] Digest channel ${CONFIG.DIGEST_CHANNEL_ID} is not available`);
+                    return;
+                }
+                const embed = await buildDailySummaryEmbed("scheduled-digest");
+                await channel.send({ embeds: [embed] });
+                console.log(`[NYX BOT] Scheduled digest posted to ${CONFIG.DIGEST_CHANNEL_ID}`);
+            } catch (error) {
+                console.error(`[NYX BOT] Scheduled digest failed: ${error.message}`);
+            }
+        }, digestIntervalMs).unref();
+    }
 });
 
 // Auto-leave if the bot is added to a server that is not on the allowlist.
@@ -650,13 +723,29 @@ function giveawayRow(id) {
 
 async function handleButton(interaction) {
     const [prefix, id] = interaction.customId.split(":");
-    if (!id || !["nyx_confirm", "nyx_cancel", "nyx_giveaway"].includes(prefix)) return;
+    if (!id || !["nyx_confirm", "nyx_cancel", "nyx_giveaway", "nyx_ticket_close"].includes(prefix)) return;
     // Buttons are subject to the same server allowlist as commands.
     if (interaction.guildId && !isAllowedGuild(interaction.guildId)) {
         logDenied(interaction, "server not on allowlist");
         return interaction.reply({ embeds: [errorEmbed("Commands are not enabled in this server.")], ephemeral: true });
     }
     if (prefix === "nyx_giveaway") return handleGiveawayClaim(interaction, id);
+    if (prefix === "nyx_ticket_close") {
+        const openerId = id;
+        const isOpener = interaction.user.id === openerId;
+        const isStaff = isAdministrator(interaction.member);
+        if (!isOpener && !isStaff) {
+            return interaction.reply({ embeds: [errorEmbed("Only the ticket opener or an administrator can close this ticket.")], ephemeral: true });
+        }
+        await interaction.reply({ embeds: [nyxEmbed("Closing ticket", "This channel will be deleted shortly.")], ephemeral: true });
+        try {
+            await interaction.channel?.delete(`Ticket closed by ${interaction.user.tag}`);
+        } catch (error) {
+            console.error(`[NYX BOT] Could not delete ticket channel: ${error.message}`);
+            return interaction.followUp({ embeds: [errorEmbed("Could not delete this channel. Check the bot's Manage Channels permission.")], ephemeral: true }).catch(() => {});
+        }
+        return;
+    }
     const pending = pendingActions.get(id);
     if (!pending || pending.userId !== interaction.user.id || pending.guildId !== interaction.guildId || pending.expiresAt < Date.now()) {
         pendingActions.delete(id);
@@ -725,9 +814,9 @@ client.on("interactionCreate", async (interaction) => {
         if (commandName === "help") {
             const embed = nyxEmbed("NYX command guide", "Website accounts use a license from this bot, a linked Discord account, and a one-time launch code.")
                 .addFields(
-                    { name: "Account", value: "`/help` — this guide\n`/health` — service availability\n`/mystatus` — linked account status\n`/redeem` — validate a key and get your registration link\n`/download` — client download link and latest version\n`/link` — how to connect Discord", inline: false },
+                    { name: "Account", value: "`/help` — this guide\n`/health` — service availability\n`/mystatus` — linked account status\n`/redeem` — validate a key and get your registration link\n`/download` — client download link and latest version\n`/link` — how to connect Discord\n`/ticket` — open a private support ticket", inline: false },
                     { name: "License team", value: "`/keygen` `/keyinfo` `/keys` `/setgenrole`", inline: false },
-                    { name: "Administrators", value: "`/stats` `/daily` `/status` `/userlookup` `/whois` `/notifyall` `/notifyuser` `/giveaway` `/keyrevoke` `/keyreset` `/keyextend` `/keypause` `/keyresume` `/keynote`", inline: false },
+                    { name: "Administrators", value: "`/stats` `/daily` `/digest` `/status` `/userlookup` `/whois` `/notifyall` `/notifyuser` `/giveaway` `/keyrevoke` `/keyreset` `/keyextend` `/keypause` `/keyresume` `/keynote`", inline: false },
                     { name: "Owner", value: "`/owner` — manage the server allowlist", inline: false }
                 );
             return interaction.reply({ embeds: [embed], ephemeral: true });
@@ -892,25 +981,109 @@ client.on("interactionCreate", async (interaction) => {
         if (commandName === "daily") {
             if (!isAdministrator(member)) return interaction.reply({ embeds: [errorEmbed("Administrator permission is required.")], ephemeral: true });
             await interaction.deferReply({ ephemeral: true });
-            const [statsResult, expiringResult] = await Promise.all([
-                callAuthApi("/api/bot/keys", { action: "stats", actorId: interaction.user.id }),
-                callAuthApi("/api/bot/expiring", { windowSeconds: 72 * 60 * 60 }).catch(() => ({ expiring: [] }))
-            ]);
-            const stats = statsResult.stats;
-            const expiringSoon = expiringResult.expiring.slice(0, 8);
-            const embed = nyxEmbed("Daily NYX summary", `Snapshot at ${formatTimestamp(Math.floor(Date.now() / 1000))}`)
-                .addFields(
-                    { name: "Total licenses", value: String(stats.total), inline: true },
-                    { name: "Active", value: String(stats.active), inline: true },
-                    { name: "Unused", value: String(stats.unused), inline: true },
-                    { name: "Paused", value: String(stats.paused), inline: true },
-                    { name: "Expired", value: String(stats.expired), inline: true },
-                    { name: "Revoked", value: String(stats.revoked), inline: true }
-                );
-            if (expiringSoon.length) {
-                embed.addFields({ name: "Expiring within 72h", value: expiringSoon.map((entry) => `\`${entry.keyPreview ?? entry.username}\` — ${formatTimestamp(entry.expiresAt)}`).join("\n") });
+            const embed = await buildDailySummaryEmbed(interaction.user.id);
+            return interaction.editReply({ embeds: [embed] });
+        }
+
+        if (commandName === "digest") {
+            if (!isAdministrator(member)) return interaction.reply({ embeds: [errorEmbed("Administrator permission is required.")], ephemeral: true });
+            await interaction.deferReply({ ephemeral: true });
+            const embed = await buildDailySummaryEmbed(interaction.user.id);
+            const postPublic = interaction.options.getBoolean("public") === true;
+            if (postPublic) {
+                if (!CONFIG.DIGEST_CHANNEL_ID) {
+                    return interaction.editReply({ embeds: [errorEmbed("DIGEST_CHANNEL_ID is not configured. Ask an admin to set it before posting publicly.")] });
+                }
+                const channel = await client.channels.fetch(CONFIG.DIGEST_CHANNEL_ID).catch(() => null);
+                if (!channel?.isTextBased()) {
+                    return interaction.editReply({ embeds: [errorEmbed("DIGEST_CHANNEL_ID does not point to an available text channel.")] });
+                }
+                await channel.send({ embeds: [embed] });
+                await sendAudit("Digest posted", interaction, `Posted daily digest to <#${CONFIG.DIGEST_CHANNEL_ID}>`);
+                return interaction.editReply({ embeds: [embed, nyxEmbed("Digest posted", `Also sent to <#${CONFIG.DIGEST_CHANNEL_ID}>.`)] });
             }
             return interaction.editReply({ embeds: [embed] });
+        }
+
+        if (commandName === "ticket") {
+            if (!interaction.guild) {
+                return interaction.reply({ embeds: [errorEmbed("Tickets can only be opened inside a server.")], ephemeral: true });
+            }
+            if (!CONFIG.TICKET_CATEGORY_ID) {
+                return interaction.reply({ embeds: [errorEmbed("Ticket support is not configured. Ask an administrator to set `TICKET_CATEGORY_ID`.")], ephemeral: true });
+            }
+            await interaction.deferReply({ ephemeral: true });
+            const category = await interaction.guild.channels.fetch(CONFIG.TICKET_CATEGORY_ID).catch(() => null);
+            if (!category || category.type !== ChannelType.GuildCategory) {
+                return interaction.editReply({ embeds: [errorEmbed("Ticket support is misconfigured. Ask an administrator to set a valid `TICKET_CATEGORY_ID`.")] });
+            }
+            const existing = interaction.guild.channels.cache.find(
+                (channel) => channel.parentId === category.id
+                    && channel.name === ticketChannelName(interaction.user.username)
+                    && channel.permissionOverwrites?.cache?.has(interaction.user.id)
+            );
+            if (existing) {
+                return interaction.editReply({ embeds: [nyxEmbed("Ticket already open", `You already have an open ticket: ${existing}`)] });
+            }
+            const overwrites = [
+                { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+                {
+                    id: interaction.user.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.AttachFiles,
+                        PermissionFlagsBits.EmbedLinks
+                    ]
+                },
+                {
+                    id: client.user.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.ManageChannels,
+                        PermissionFlagsBits.EmbedLinks
+                    ]
+                }
+            ];
+            for (const role of interaction.guild.roles.cache.values()) {
+                if (role.id === interaction.guild.id) continue;
+                if (!role.permissions.has(PermissionFlagsBits.Administrator)) continue;
+                overwrites.push({
+                    id: role.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.ManageMessages,
+                        PermissionFlagsBits.AttachFiles,
+                        PermissionFlagsBits.EmbedLinks
+                    ]
+                });
+            }
+            let ticketChannel;
+            try {
+                ticketChannel = await interaction.guild.channels.create({
+                    name: ticketChannelName(interaction.user.username),
+                    type: ChannelType.GuildText,
+                    parent: category.id,
+                    topic: `Support ticket for ${interaction.user.tag} (${interaction.user.id})`,
+                    permissionOverwrites: overwrites,
+                    reason: `Ticket opened by ${interaction.user.tag}`
+                });
+            } catch (error) {
+                console.error(`[NYX BOT] Could not create ticket channel: ${error.message}`);
+                return interaction.editReply({ embeds: [errorEmbed("Could not create the ticket channel. Check the bot's Manage Channels permission and category access.")] });
+            }
+            await ticketChannel.send({
+                content: `${interaction.user}`,
+                embeds: [nyxEmbed("Support ticket", `Thanks ${interaction.user}. Staff will respond here. Use the button below when you are finished.`)],
+                components: [ticketCloseRow(interaction.user.id)]
+            });
+            await sendAudit("Ticket opened", interaction, `Channel ${ticketChannel} for ${interaction.user.tag}`);
+            return interaction.editReply({ embeds: [nyxEmbed("Ticket created", `Your private ticket is ready: ${ticketChannel}`)] });
         }
 
         if (commandName === "status") {
