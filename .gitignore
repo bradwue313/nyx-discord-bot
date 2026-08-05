@@ -4,4 +4,7 @@ allowed_roles.json
 allowed_servers.json
 giveaways.json
 giveaway_cooldowns.json
+expiry_reminders.json
+*.tmp-*
+*.corrupt-*
 npm-debug.log*

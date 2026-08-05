@@ -1,13 +1,23 @@
 {
-  "name": "nyx-discord-bot",
-  "version": "2.1.0",
-  "description": "NYX External Discord license administration bot",
-  "main": "bot.js",
-  "scripts": {
-    "start": "node bot.js",
-    "test": "node --check bot.js"
-  },
-  "dependencies": {
-    "discord.js": "^14.14.1"
-  }
+    "name": "nyx-discord-bot",
+    "version": "2.2.0",
+    "description": "NYX External Discord license administration bot",
+    "main": "bot.js",
+    "engines": {
+        "node": ">=22"
+    },
+    "scripts": {
+        "start": "node bot.js",
+        "check": "node --check bot.js && node --check index.js && node --check src/*.js && node --check src/handlers/*.js",
+        "test": "npm run check && node --test \"test/*.test.js\"",
+        "lint": "eslint .",
+        "format": "prettier --write ."
+    },
+    "dependencies": {
+        "discord.js": "^14.14.1"
+    },
+    "devDependencies": {
+        "eslint": "^9.39.5",
+        "prettier": "^3.9.6"
+    }
 }
