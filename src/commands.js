@@ -1,6 +1,6 @@
 "use strict";
 
-const { PermissionFlagsBits, SlashCommandBuilder } = require("discord.js");
+const { ApplicationCommandType, ContextMenuCommandBuilder, PermissionFlagsBits, SlashCommandBuilder } = require("discord.js");
 
 const durations = [
     { name: "12 Hours", value: "12h" },
@@ -131,8 +131,17 @@ const commands = [
         .setDescription("Post or view the daily license digest (administrators)")
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
         .addBooleanOption((option) => option.setName("public").setDescription("Also post the digest to DIGEST_CHANNEL_ID")),
+    new SlashCommandBuilder().setName("ping").setDescription("Check bot latency and uptime"),
     new SlashCommandBuilder().setName("ticket").setDescription("Open a private support ticket channel"),
     new SlashCommandBuilder().setName("status").setDescription("Show live NYX service and license metrics"),
+    new SlashCommandBuilder()
+        .setName("verify")
+        .setDescription("Verify your linked NYX account and get the member role")
+        .addUserOption((option) => option.setName("user").setDescription("Member to verify (administrators only)")),
+    new SlashCommandBuilder()
+        .setName("verifysync")
+        .setDescription("Re-check verified members and strip the role from inactive accounts")
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
     new SlashCommandBuilder()
         .setName("giveaway")
         .setDescription("Drop giveaway license keys with a claim button")
@@ -147,6 +156,11 @@ const commands = [
         .addIntegerOption((option) =>
             option.setName("count").setDescription("Number of keys, from 1 to 10").setMinValue(1).setMaxValue(10)
         ),
+    new SlashCommandBuilder()
+        .setName("giveawayend")
+        .setDescription("End a giveaway early (message ID or link)")
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+        .addStringOption((option) => option.setName("message").setDescription("Giveaway message ID or link").setRequired(true)),
     new SlashCommandBuilder()
         .setName("owner")
         .setDescription("Manage the server allowlist (owner only)")
@@ -164,4 +178,17 @@ const commands = [
         .addStringOption((option) => option.setName("serverid").setDescription("Guild ID to allow or deny"))
 ];
 
-module.exports = { commands, durations };
+// Right-click context menus (guild-registered, admin-gated). The router
+// dispatches them by the same name the handlers map is keyed on.
+const contextMenus = [
+    new ContextMenuCommandBuilder()
+        .setName("Look up license")
+        .setType(ApplicationCommandType.User)
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    new ContextMenuCommandBuilder()
+        .setName("Check license key")
+        .setType(ApplicationCommandType.Message)
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+];
+
+module.exports = { commands, contextMenus, durations };

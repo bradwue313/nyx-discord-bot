@@ -6,6 +6,7 @@ const { formatTimestamp } = require("./util");
 const { isAllowedGuild, isAdministrator, logDenied } = require("./access");
 const { sendAudit } = require("./audit");
 const { handleGiveawayClaim } = require("./giveaways");
+const { postTicketTranscript } = require("./tickets");
 const state = require("./state");
 
 async function handleButton(interaction) {
@@ -21,7 +22,7 @@ async function handleButton(interaction) {
         if (id !== interaction.user.id)
             return interaction.reply({ embeds: [errorEmbed("This panel belongs to another user.")], ephemeral: true });
         await interaction.deferReply({ ephemeral: true });
-        const result = await callAuthApi("/api/bot/status", { discordId: interaction.user.id });
+        const result = await callAuthApi("/api/bot/status", { discordId: interaction.user.id }, { retries: 1 });
         if (!result.linked) {
             return interaction.editReply({
                 embeds: [nyxEmbed("Account not linked", "Sign in on the website and connect Discord before launching.")]
@@ -48,6 +49,8 @@ async function handleButton(interaction) {
             });
         }
         await interaction.reply({ embeds: [nyxEmbed("Closing ticket", "This channel will be deleted shortly.")], ephemeral: true });
+        // Archive the transcript before deletion (best effort).
+        await postTicketTranscript(interaction.channel, interaction.user.username);
         try {
             await interaction.channel?.delete(`Ticket closed by ${interaction.user.username}`);
         } catch (error) {

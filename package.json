@@ -1,6 +1,6 @@
 {
     "name": "nyx-discord-bot",
-    "version": "2.2.0",
+    "version": "2.3.0",
     "description": "NYX External Discord license administration bot",
     "main": "bot.js",
     "engines": {

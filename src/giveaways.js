@@ -5,6 +5,7 @@ const { client } = require("./client");
 const { CONFIG } = require("./config");
 const { callAuthApi } = require("./api");
 const { nyxEmbed, errorEmbed } = require("./embeds");
+const { evaluateClaimGate } = require("./util");
 const state = require("./state");
 
 function giveawayRow(id) {
@@ -44,6 +45,39 @@ async function handleGiveawayClaim(interaction, messageId) {
     if (giveaway.claimed.includes(userId)) {
         return interaction.reply({ embeds: [errorEmbed("You already claimed a key from this giveaway.")], ephemeral: true });
     }
+
+    // Claim gating: optional required role, optional linked-account
+    // requirement, and an optional per-user cooldown across giveaways.
+    let linked = true;
+    if (CONFIG.GIVEAWAY_REQUIRE_LINKED) {
+        try {
+            const status = await callAuthApi("/api/bot/status", { discordId: userId }, { retries: 1 });
+            linked = Boolean(status.linked);
+        } catch {
+            linked = false;
+        }
+    }
+    const gate = evaluateClaimGate({
+        requireLinked: CONFIG.GIVEAWAY_REQUIRE_LINKED,
+        linked,
+        requiredRoleId: CONFIG.GIVEAWAY_REQUIRED_ROLE_ID,
+        memberRoleIds: interaction.member?.roles?.cache?.map((role) => role.id) || [],
+        cooldownMs: CONFIG.GIVEAWAY_CLAIM_COOLDOWN_MINUTES * 60_000,
+        lastClaimAtMs: state.getLastGiveawayClaim(interaction.guildId, userId),
+        now: Date.now()
+    });
+    if (!gate.allowed) {
+        const messages = {
+            role: "This giveaway is restricted to members with a specific role.",
+            linked: "Your Discord must be linked to a NYX account to claim giveaway keys. Sign in on the dashboard, connect Discord, then try again.",
+            cooldown: `You claimed a key from a recent giveaway. Try again in **${gate.waitMinutes} minute${gate.waitMinutes === 1 ? "" : "s"}**.`
+        };
+        return interaction.reply({
+            embeds: [errorEmbed(messages[gate.reason] || "You cannot claim this giveaway right now.")],
+            ephemeral: true
+        });
+    }
+
     const nextKey = giveaway.keys.shift();
     if (!nextKey) {
         return interaction.reply({ embeds: [errorEmbed("All giveaway keys have been claimed.")], ephemeral: true });
@@ -67,6 +101,7 @@ async function handleGiveawayClaim(interaction, messageId) {
         });
     }
     const remaining = giveaway.keys.length;
+    state.recordGiveawayClaim(interaction.guildId, userId);
     state.queueGiveawaySave();
     await interaction.reply({
         embeds: [
@@ -120,7 +155,13 @@ async function postAutoGiveaway() {
             ],
             components: [giveawayRow("pending")]
         });
-        state.getGiveaways().set(message.id, { keys: result.keys, claimed: [], duration: CONFIG.GIVEAWAY_AUTO_DURATION });
+        state.getGiveaways().set(message.id, {
+            keys: result.keys,
+            claimed: [],
+            duration: CONFIG.GIVEAWAY_AUTO_DURATION,
+            guildId: channel.guildId,
+            channelId: channel.id
+        });
         state.queueGiveawaySave();
         await message.edit({ components: [giveawayRow(message.id)] });
         console.log(

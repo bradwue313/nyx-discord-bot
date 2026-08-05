@@ -5,7 +5,7 @@ const { CONFIG } = require("./config");
 const state = require("./state");
 
 // Public commands that are safe to run in DMs or non-whitelisted servers.
-const PUBLIC_COMMANDS = new Set(["panel", "help", "health", "mystatus", "download", "link", "setup", "privacy"]);
+const PUBLIC_COMMANDS = new Set(["panel", "help", "health", "mystatus", "download", "link", "setup", "privacy", "ping"]);
 
 function isAllowedGuild(guildId) {
     return state.isAllowedGuild(guildId);

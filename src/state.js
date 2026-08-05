@@ -178,6 +178,18 @@ const pendingActions = new Map(); // id -> { action, key?, message?, userId, gui
 // notification queue forever. Values are { count, at }.
 const deliveryAttempts = new Map();
 
+// Per-user giveaway claim timestamps keyed "guildId:userId", used to enforce
+// GIVEAWAY_CLAIM_COOLDOWN_MINUTES across giveaways. Pruned alongside sessions.
+const giveawayClaimHistory = new Map(); // "guildId:userId" -> timestamp
+
+function recordGiveawayClaim(guildId, userId, now = Date.now()) {
+    giveawayClaimHistory.set(`${guildId}:${userId}`, now);
+}
+
+function getLastGiveawayClaim(guildId, userId) {
+    return giveawayClaimHistory.get(`${guildId}:${userId}`) || 0;
+}
+
 function pruneSessions() {
     const now = Date.now();
     for (const [id, pending] of pendingActions.entries()) {
@@ -185,6 +197,9 @@ function pruneSessions() {
     }
     for (const [key, record] of deliveryAttempts.entries()) {
         if (now - record.at > 24 * 60 * 60 * 1000) deliveryAttempts.delete(key);
+    }
+    for (const [key, timestamp] of giveawayClaimHistory.entries()) {
+        if (now - timestamp > 48 * 60 * 60 * 1000) giveawayClaimHistory.delete(key);
     }
 }
 
@@ -218,5 +233,7 @@ module.exports = {
     pendingActions,
     pruneSessions,
     recordDeliveryFailure,
-    clearDeliveryFailure
+    clearDeliveryFailure,
+    recordGiveawayClaim,
+    getLastGiveawayClaim
 };

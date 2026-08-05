@@ -25,9 +25,15 @@ Optional variables:
 - `GIVEAWAY_AUTO_DURATION` — license duration for auto-giveaways (default `1w`).
 - `GIVEAWAY_AUTO_COUNT` — number of keys per auto-giveaway (1–25, default 3).
 - `TICKET_CATEGORY_ID` — category ID that `/ticket` channels are created under.
+- `TICKET_TRANSCRIPT_CHANNEL_ID` — channel to archive closed-ticket transcripts to (falls back to `AUDIT_LOG_CHANNEL_ID`).
+- `VERIFY_ROLE_ID` — role granted by `/verify` to members whose Discord is linked to an active license (also auto-assigned on join).
 - `DIGEST_CHANNEL_ID` — channel ID for the scheduled daily license digest.
 - `DIGEST_TIME` — fixed daily digest time in 24-hour UTC (`HH:MM`). Wins over the interval below.
 - `DIGEST_INTERVAL_HOURS` — fallback digest cadence in hours (0 disables, default 0).
+- `GIVEAWAY_REQUIRED_ROLE_ID` — optional role required to claim giveaway keys.
+- `GIVEAWAY_REQUIRE_LINKED` — when `true`, only Discord accounts linked to NYX can claim giveaway keys (default `false`).
+- `GIVEAWAY_CLAIM_COOLDOWN_MINUTES` — per-user cooldown between giveaway claims (default 0).
+- `PUBLIC_RATE_LIMIT_PER_MINUTE` — per-user limit for `/mystatus`, `/redeem`, and `/verify` (default 10).
 
 ## Commands
 
@@ -42,7 +48,13 @@ Account commands (available in DMs and all servers):
 - `/redeem` — validate a license key and get your registration link.
 - `/download` — client download link and latest version.
 - `/link` — how to connect your Discord account.
+- `/ping` — bot gateway latency and uptime.
 - `/ticket` — open a private support ticket channel (server only).
+
+Verification:
+
+- `/verify` — check that your Discord is linked to an active license and grant the configured member role.
+- `/verifysync` — re-check verified members and strip the role from inactive or unlinked accounts (administrators).
 
 License-team commands:
 
@@ -62,9 +74,15 @@ Administrator commands:
 - `/notifyall` — broadcast a DM to accounts with release alerts enabled (requires a confirmation click).
 - `/notifyuser` — queue a DM for a specific linked Discord user.
 - `/giveaway` — drop giveaway license keys with a claim button.
+- `/giveawayend` — stop a giveaway early (message ID or link).
 - `/keyrevoke`, `/keyreset`, `/keypause`, `/keyresume` — confirmed license actions.
 - `/keyextend` — replace the expiration period.
 - `/keynote` — save a private moderator note.
+
+Context menus (right-click, administrators):
+
+- **Look up license** on a member — instant license lookup without typing IDs.
+- **Check license key** on a message — inspect a key that appears in a message.
 
 Owner commands:
 
@@ -99,7 +117,7 @@ Public account commands are registered globally so they work in DMs. The full co
     - `embeds.js`, `audit.js`, `tickets.js`, `giveaways.js` — shared rendering and features.
     - `polls.js` — notification, expiry-reminder, and security-alert polls with exponential backoff.
     - `commands.js` — slash-command definitions.
-    - `handlers/` — one module per command group (account, licensing, actions, support).
+    - `handlers/` — one module per command group (account, licensing, actions, support, tools).
     - `buttons.js` — button interactions (confirmations, giveaway claims, tickets, panel).
     - `router.js` — access gate, dispatch, and user-safe error mapping.
     - `registration.js` — global and per-guild command registration.

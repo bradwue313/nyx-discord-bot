@@ -2,11 +2,15 @@
 
 const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require("discord.js");
 const { CONFIG } = require("../config");
-const { nyxEmbed } = require("../embeds");
+const { nyxEmbed, errorEmbed } = require("../embeds");
 const { callAuthApi, websiteHealth, fetchPublicStatus } = require("../api");
-const { formatTimestamp } = require("../util");
+const { formatTimestamp, launchReadinessMessage, RateLimiter } = require("../util");
 const { runtime } = require("../runtime");
 const { pollHealth } = require("../polls");
+
+// Public API-touching commands are rate-limited per user so they cannot be
+// spammed: /mystatus, /redeem (and /verify, which has its own limiter).
+const publicApiLimiter = new RateLimiter(CONFIG.PUBLIC_RATE_LIMIT_PER_MINUTE, 60_000);
 
 // ---------------------------------------------------------------------------
 // /panel — account and support controls
@@ -99,13 +103,18 @@ async function help(interaction) {
     const embed = nyxEmbed("NYX commands", "Use `/panel` for the common account and launch actions.").addFields(
         {
             name: "Account",
-            value: "`/panel` `/setup` `/health` `/mystatus` `/redeem` `/download` `/link` `/privacy` `/ticket`",
+            value: "`/panel` `/setup` `/health` `/mystatus` `/redeem` `/download` `/link` `/privacy` `/ticket` `/ping`",
             inline: false
         },
         { name: "License team", value: "`/keygen` `/keyinfo` `/keys` `/setgenrole`", inline: false },
         {
+            name: "Verification",
+            value: "`/verify` — get the member role with an active license · `/verifysync` — clean up stale roles",
+            inline: false
+        },
+        {
             name: "Administrators",
-            value: "`/stats` `/daily` `/digest` `/status` `/userlookup` `/whois` `/notifyall` `/notifyuser` `/giveaway` `/keyrevoke` `/keyreset` `/keyextend` `/keypause` `/keyresume` `/keynote`",
+            value: "`/stats` `/daily` `/digest` `/status` `/userlookup` `/whois` `/notifyall` `/notifyuser` `/giveaway` `/giveawayend` `/keyrevoke` `/keyreset` `/keyextend` `/keypause` `/keyresume` `/keynote`",
             inline: false
         },
         { name: "Owner", value: "`/owner` — manage the server allowlist", inline: false }
@@ -143,24 +152,17 @@ async function health(interaction) {
 // ---------------------------------------------------------------------------
 
 async function mystatus(interaction) {
+    if (!publicApiLimiter.allow(interaction.user.id)) {
+        return interaction.reply({ embeds: [errorEmbed("This command is rate-limited. Try again in a minute.")], ephemeral: true });
+    }
     await interaction.deferReply({ ephemeral: true });
-    const result = await callAuthApi("/api/bot/status", { discordId: interaction.user.id });
+    const result = await callAuthApi("/api/bot/status", { discordId: interaction.user.id }, { retries: 1 });
     if (!result.linked)
         return interaction.editReply({
             embeds: [nyxEmbed("Discord not linked", "Sign in to the NYX website dashboard and choose **Connect Discord**.")]
         });
     const account = result.account;
-    const launchReadiness = result.active
-        ? account.deviceId
-            ? "READY TO LAUNCH"
-            : "Launch blocked — no device bound. Launch NYX once to bind your hardware."
-        : {
-              revoked: "Launch blocked — your license was revoked.",
-              paused: "Launch blocked — your license is paused.",
-              expired: "Launch blocked — your license has expired.",
-              device_unbound: "Launch blocked — no device bound.",
-              not_linked: "Launch blocked — Discord is not linked."
-          }[result.reason] || "Launch blocked — see the dashboard.";
+    const launchReadiness = launchReadinessMessage(result);
     return interaction.editReply({
         embeds: [
             nyxEmbed("Your NYX account").addFields(
@@ -190,9 +192,12 @@ async function mystatus(interaction) {
 // ---------------------------------------------------------------------------
 
 async function redeem(interaction) {
+    if (!publicApiLimiter.allow(interaction.user.id)) {
+        return interaction.reply({ embeds: [errorEmbed("This command is rate-limited. Try again in a minute.")], ephemeral: true });
+    }
     await interaction.deferReply({ ephemeral: true });
     const key = interaction.options.getString("key").trim();
-    const result = await callAuthApi("/api/bot/keys", { action: "validate", key });
+    const result = await callAuthApi("/api/bot/keys", { action: "validate", key }, { retries: 1 });
     if (!result.redeemable) {
         const reason =
             result.reason === "already_claimed"

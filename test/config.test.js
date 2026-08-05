@@ -39,3 +39,31 @@ test("parseConfig keeps optional ids as strings", () => {
     assert.equal(config.DIGEST_CHANNEL_ID, "chan1");
     assert.equal(config.DIGEST_TIME, "09:30");
 });
+
+test("parseConfig parses verification and giveaway gating", () => {
+    const config = parseConfig({
+        ...baseEnv(),
+        VERIFY_ROLE_ID: "role1",
+        GIVEAWAY_REQUIRED_ROLE_ID: "role2",
+        GIVEAWAY_REQUIRE_LINKED: "true",
+        GIVEAWAY_CLAIM_COOLDOWN_MINUTES: "45",
+        TICKET_TRANSCRIPT_CHANNEL_ID: "chan9",
+        PUBLIC_RATE_LIMIT_PER_MINUTE: "25"
+    });
+    assert.equal(config.VERIFY_ROLE_ID, "role1");
+    assert.equal(config.GIVEAWAY_REQUIRED_ROLE_ID, "role2");
+    assert.equal(config.GIVEAWAY_REQUIRE_LINKED, true);
+    assert.equal(config.GIVEAWAY_CLAIM_COOLDOWN_MINUTES, 45);
+    assert.equal(config.TICKET_TRANSCRIPT_CHANNEL_ID, "chan9");
+    assert.equal(config.PUBLIC_RATE_LIMIT_PER_MINUTE, 25);
+});
+
+test("parseConfig defaults gating and clamps the public rate limit", () => {
+    const config = parseConfig(baseEnv());
+    assert.equal(config.GIVEAWAY_REQUIRE_LINKED, false);
+    assert.equal(config.GIVEAWAY_CLAIM_COOLDOWN_MINUTES, 0);
+    assert.equal(config.PUBLIC_RATE_LIMIT_PER_MINUTE, 10);
+    const clamped = parseConfig({ ...baseEnv(), PUBLIC_RATE_LIMIT_PER_MINUTE: "999", GIVEAWAY_CLAIM_COOLDOWN_MINUTES: "-1" });
+    assert.equal(clamped.PUBLIC_RATE_LIMIT_PER_MINUTE, 120);
+    assert.equal(clamped.GIVEAWAY_CLAIM_COOLDOWN_MINUTES, 0);
+});

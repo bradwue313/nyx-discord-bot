@@ -2,7 +2,7 @@
 
 const { REST, Routes } = require("discord.js");
 const { CONFIG } = require("./config");
-const { commands } = require("./commands");
+const { commands, contextMenus } = require("./commands");
 const { PUBLIC_COMMANDS } = require("./access");
 
 const rest = new REST({ version: "10" }).setToken(CONFIG.TOKEN);
@@ -22,8 +22,9 @@ async function registerPublicCommands() {
 async function registerGuildCommands(guildId) {
     if (!guildId) return;
     try {
-        await rest.put(Routes.applicationGuildCommands(CONFIG.CLIENT_ID, guildId), { body: commands.map((command) => command.toJSON()) });
-        console.log(`[NYX BOT] Registered ${commands.length} commands for guild ${guildId}`);
+        const body = [...commands.map((command) => command.toJSON()), ...contextMenus.map((menu) => menu.toJSON())];
+        await rest.put(Routes.applicationGuildCommands(CONFIG.CLIENT_ID, guildId), { body });
+        console.log(`[NYX BOT] Registered ${commands.length} commands + ${contextMenus.length} context menus for guild ${guildId}`);
     } catch (error) {
         console.error(`[NYX BOT] Could not register commands for guild ${guildId}: ${error.message}`);
     }

@@ -69,7 +69,7 @@ function expiringReminderEmbed(license, hoursLeft) {
 /** Shared daily / digest snapshot used by /daily, /digest, and the scheduled poster. */
 async function buildDailySummaryEmbed(actorId = "system") {
     const [statsResult, expiringResult] = await Promise.all([
-        callAuthApi("/api/bot/keys", { action: "stats", actorId }),
+        callAuthApi("/api/bot/keys", { action: "stats", actorId }, { retries: 1 }),
         callAuthApi("/api/bot/expiring", { windowSeconds: 72 * 60 * 60 }).catch(() => ({ expiring: [] }))
     ]);
     const stats = statsResult.stats;

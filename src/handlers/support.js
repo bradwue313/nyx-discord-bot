@@ -166,7 +166,13 @@ async function giveaway(interaction) {
         ],
         components: [giveawayRow("pending")]
     });
-    state.getGiveaways().set(posted.id, { keys: result.keys, claimed: [], duration });
+    state.getGiveaways().set(posted.id, {
+        keys: result.keys,
+        claimed: [],
+        duration,
+        guildId: interaction.guildId,
+        channelId: interaction.channel.id
+    });
     state.queueGiveawaySave();
     await posted.edit({ components: [giveawayRow(posted.id)] });
     await sendAudit("Giveaway started", interaction, `${result.keys.length} × ${duration}`);

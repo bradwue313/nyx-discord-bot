@@ -21,23 +21,39 @@ function friendlyErrorMessage(error) {
     return "Something went wrong. Try again, or ask a moderator for help.";
 }
 
+// --- Access gate -----------------------------------------------------------
+// DMs: only public commands. Guilds: only whitelisted servers. Returns false
+// (after replying) when the interaction is not allowed to proceed.
+async function enforceAccessGate(interaction) {
+    const { commandName } = interaction;
+    if (interaction.guildId) {
+        if (!isAllowedGuild(interaction.guildId)) {
+            logDenied(interaction, "server not on allowlist");
+            await interaction.reply({ embeds: [errorEmbed("Commands are not enabled in this server.")], ephemeral: true });
+            return false;
+        }
+    } else if (!PUBLIC_COMMANDS.has(commandName)) {
+        logDenied(interaction, "sensitive command used in DMs");
+        await interaction.reply({ embeds: [errorEmbed("This command must be used inside an authorized server.")], ephemeral: true });
+        return false;
+    }
+    return true;
+}
+
 async function handleInteraction(interaction) {
     try {
         if (interaction.isButton()) return await handleButton(interaction);
+        if (interaction.isUserContextMenuCommand() || interaction.isMessageContextMenuCommand()) {
+            if (!(await enforceAccessGate(interaction))) return;
+            const handler = handlers.get(interaction.commandName);
+            if (!handler)
+                return interaction.reply({ embeds: [errorEmbed(`Unknown command ${interaction.commandName}.`)], ephemeral: true });
+            return await handler(interaction);
+        }
         if (!interaction.isChatInputCommand()) return;
         const { commandName } = interaction;
 
-        // --- Access gate ---------------------------------------------------
-        // DMs: only public commands. Guilds: only whitelisted servers.
-        if (interaction.guildId) {
-            if (!isAllowedGuild(interaction.guildId)) {
-                logDenied(interaction, "server not on allowlist");
-                return interaction.reply({ embeds: [errorEmbed("Commands are not enabled in this server.")], ephemeral: true });
-            }
-        } else if (!PUBLIC_COMMANDS.has(commandName)) {
-            logDenied(interaction, "sensitive command used in DMs");
-            return interaction.reply({ embeds: [errorEmbed("This command must be used inside an authorized server.")], ephemeral: true });
-        }
+        if (!(await enforceAccessGate(interaction))) return;
 
         const handler = handlers.get(commandName);
         if (!handler) {

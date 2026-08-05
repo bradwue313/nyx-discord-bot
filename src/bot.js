@@ -9,6 +9,7 @@ const { startPolls } = require("./polls");
 const { loadGiveawayStateFromWebsite, startAutoGiveaway } = require("./giveaways");
 const { registerPublicCommands, registerAllGuildCommands, registerGuildCommands } = require("./registration");
 const { buildDailySummaryEmbed } = require("./embeds");
+const { callAuthApi } = require("./api");
 const { handleInteraction } = require("./router");
 
 validateConfig();
@@ -53,6 +54,23 @@ client.once("ready", async () => {
 
 // Auto-leave if the bot is added to a server that is not on the allowlist;
 // whitelisted servers get their guild command set registered immediately.
+// Auto-verify: if a verification role is configured and the joining member's
+// Discord is linked to an active license, grant the role immediately.
+client.on("guildMemberAdd", async (member) => {
+    if (member.user.bot) return;
+    if (!state.isAllowedGuild(member.guild.id)) return;
+    if (!CONFIG.VERIFY_ROLE_ID) return;
+    try {
+        const result = await callAuthApi("/api/bot/status", { discordId: member.id }, { retries: 1 });
+        if (result.linked && result.active) {
+            await member.roles.add(CONFIG.VERIFY_ROLE_ID, "NYX auto-verify on join");
+            console.log(`[NYX BOT] Auto-verified ${member.user.username} (${member.id}) on join`);
+        }
+    } catch (error) {
+        console.error(`[NYX BOT] Auto-verify failed for ${member.id}: ${error.message}`);
+    }
+});
+
 client.on("guildCreate", async (guild) => {
     if (state.isAllowedGuild(guild.id)) {
         console.log(`[NYX BOT] Added to whitelisted guild ${guild.id} (${guild.name})`);

@@ -60,6 +60,88 @@ function splitCsv(value) {
         .filter(Boolean);
 }
 
+/** Parse a boolean env value; falls back when unset or unrecognized. */
+function parseBool(value, fallback = false) {
+    if (value == null || value === "") return fallback;
+    const normalized = String(value).trim().toLowerCase();
+    if (["1", "true", "yes", "on", "enabled"].includes(normalized)) return true;
+    if (["0", "false", "no", "off", "disabled"].includes(normalized)) return false;
+    return fallback;
+}
+
+/**
+ * Extract the first license-key-looking token from free text (used by the
+ * "Check license key" message context menu). Accepts 12–80 character tokens
+ * of letters, digits and dashes that contain at least one letter and one
+ * digit, so normal sentences are never matched.
+ */
+function extractLicenseKey(text) {
+    if (!text) return null;
+    const tokens = String(text).match(/[A-Za-z0-9][A-Za-z0-9-]{11,79}/gu) || [];
+    for (const token of tokens) {
+        const hasLetter = /[A-Za-z]/u.test(token);
+        const hasDigit = /[0-9]/u.test(token);
+        if (hasLetter && hasDigit && !token.includes("--")) return token;
+    }
+    return null;
+}
+
+/**
+ * Accept either a raw Discord message ID or a Discord message link
+ * (https://discord.com/channels/guild/channel/message), returning the ID.
+ */
+function parseMessageId(linkOrId) {
+    if (!linkOrId) return null;
+    const value = String(linkOrId).trim();
+    if (/^\d{15,20}$/u.test(value)) return value;
+    const match = value.match(/(\d{15,20})[/?]?$/u);
+    return match ? match[1] : null;
+}
+
+/**
+ * Decide whether a member may claim from a giveaway. Pure and unit-testable;
+ * callers map the reason codes to user-facing messages.
+ */
+function evaluateClaimGate({
+    requireLinked,
+    linked,
+    requiredRoleId,
+    memberRoleIds = [],
+    cooldownMs = 0,
+    lastClaimAtMs = 0,
+    now = Date.now()
+}) {
+    if (requiredRoleId && !memberRoleIds.includes(requiredRoleId)) {
+        return { allowed: false, reason: "role" };
+    }
+    if (requireLinked && !linked) {
+        return { allowed: false, reason: "linked" };
+    }
+    if (cooldownMs > 0 && lastClaimAtMs && now - lastClaimAtMs < cooldownMs) {
+        return { allowed: false, reason: "cooldown", waitMinutes: Math.max(1, Math.ceil((cooldownMs - (now - lastClaimAtMs)) / 60_000)) };
+    }
+    return { allowed: true };
+}
+
+/**
+ * Human-readable launch-readiness message for /mystatus and /verify.
+ * Mirrors the website's `result.reason` codes.
+ */
+function launchReadinessMessage(result) {
+    if (result.active) {
+        return result.account?.deviceId ? "READY TO LAUNCH" : "Launch blocked — no device bound. Launch NYX once to bind your hardware.";
+    }
+    return (
+        {
+            revoked: "Launch blocked — your license was revoked.",
+            paused: "Launch blocked — your license is paused.",
+            expired: "Launch blocked — your license has expired.",
+            device_unbound: "Launch blocked — no device bound.",
+            not_linked: "Launch blocked — Discord is not linked."
+        }[result.reason] || "Launch blocked — see the dashboard."
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Display helpers (pure, no discord.js dependency so they are unit-testable)
 // ---------------------------------------------------------------------------
@@ -177,6 +259,11 @@ module.exports = {
     writeJsonAtomic,
     clampInt,
     splitCsv,
+    parseBool,
+    extractLicenseKey,
+    parseMessageId,
+    evaluateClaimGate,
+    launchReadinessMessage,
     formatTimestamp,
     licenseState,
     ticketChannelName,

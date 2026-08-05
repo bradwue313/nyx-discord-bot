@@ -52,11 +52,15 @@ async function keyinfo(interaction) {
     if (!hasGeneratorPermission(interaction.member))
         return interaction.reply({ embeds: [errorEmbed("You do not have permission to inspect licenses.")], ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
-    const result = await callAuthApi("/api/bot/keys", {
-        action: "info",
-        key: interaction.options.getString("key").trim(),
-        actorId: interaction.user.id
-    });
+    const result = await callAuthApi(
+        "/api/bot/keys",
+        {
+            action: "info",
+            key: interaction.options.getString("key").trim(),
+            actorId: interaction.user.id
+        },
+        { retries: 1 }
+    );
     return interaction.editReply({ embeds: [licenseEmbed(result.license)] });
 }
 
@@ -71,11 +75,15 @@ async function searchLicenses(interaction) {
     }
     await interaction.deferReply({ ephemeral: true });
     const query = interaction.options.getString("query").trim();
-    const result = await callAuthApi("/api/bot/keys", {
-        action: commandName === "keys" ? "search" : "lookup",
-        query,
-        actorId: interaction.user.id
-    });
+    const result = await callAuthApi(
+        "/api/bot/keys",
+        {
+            action: commandName === "keys" ? "search" : "lookup",
+            query,
+            actorId: interaction.user.id
+        },
+        { retries: 1 }
+    );
     if (!result.licenses.length)
         return interaction.editReply({ embeds: [nyxEmbed("No results", "No NYX accounts or licenses matched that search.")] });
     const embed = nyxEmbed("NYX search results", `Showing ${Math.min(result.licenses.length, 10)} of ${result.licenses.length} matches.`);
@@ -128,7 +136,7 @@ async function stats(interaction) {
     if (!isAdministrator(interaction.member))
         return interaction.reply({ embeds: [errorEmbed("Administrator permission is required.")], ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
-    const { stats: totals } = await callAuthApi("/api/bot/keys", { action: "stats", actorId: interaction.user.id });
+    const { stats: totals } = await callAuthApi("/api/bot/keys", { action: "stats", actorId: interaction.user.id }, { retries: 1 });
     return interaction.editReply({
         embeds: [
             nyxEmbed("Live NYX license totals").addFields(
@@ -190,7 +198,7 @@ async function status(interaction) {
     await interaction.deferReply({ ephemeral: true });
     const [snapshot, metrics] = await Promise.all([
         fetchPublicStatus().catch(() => null),
-        callAuthApi("/api/metrics", {}).catch(() => null)
+        callAuthApi("/api/metrics", {}, { retries: 1 }).catch(() => null)
     ]);
     if (!snapshot || !metrics)
         return interaction.editReply({ embeds: [errorEmbed("The NYX website is waking up or did not respond. Try again in a moment.")] });
