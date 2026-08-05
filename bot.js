@@ -85,7 +85,7 @@ function isBotOwner(userId) {
 }
 
 // Public commands that are safe to run in DMs or non-whitelisted servers.
-const PUBLIC_COMMANDS = new Set(["help", "health", "mystatus", "download", "link"]);
+const PUBLIC_COMMANDS = new Set(["panel", "help", "health", "mystatus", "download", "link"]);
 
 // Per-guild generator roles: { [guildId]: string[] }. Scoped so a role
 // configured in one server cannot grant key generation in another.
@@ -150,30 +150,40 @@ function logDenied(interaction, reason) {
 
 function nyxEmbed(title, description = null) {
     const embed = new EmbedBuilder()
-        .setColor(0xffffff)
+		.setColor(0xdededa)
         .setTitle(title)
         .setTimestamp()
-        .setFooter({ text: "NYX ACCESS // AUTHORIZATION" });
+		.setFooter({ text: "NYX account services" });
     if (description) embed.setDescription(description);
     return embed;
 }
 
 function errorEmbed(message) {
-    return nyxEmbed("Request failed", message).setColor(0x777777);
+	return nyxEmbed("Request failed", message).setColor(0xb85c64);
 }
 
 async function callAuthApi(pathname, body) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15_000);
     try {
+		const bodyText = JSON.stringify(body);
+		const timestamp = Math.floor(Date.now() / 1000).toString();
+		const nonce = crypto.randomBytes(24).toString("base64url");
+		const bodyHash = crypto.createHash("sha256").update(bodyText).digest("base64url");
+		const canonical = `${timestamp}\n${nonce}\nPOST\n${pathname}\n${bodyHash}`;
+		const signature = crypto.createHmac("sha256", CONFIG.API_SECRET).update(canonical).digest("base64url");
         const response = await fetch(`${CONFIG.AUTH_URL}${pathname}`, {
             method: "POST",
             headers: {
                 "Authorization": `Bearer ${CONFIG.API_SECRET}`,
                 "Content-Type": "application/json",
-                "Accept": "application/json"
+				"Accept": "application/json",
+				"X-NYX-Key-Id": "current",
+				"X-NYX-Timestamp": timestamp,
+				"X-NYX-Nonce": nonce,
+				"X-NYX-Signature": signature
             },
-            body: JSON.stringify(body),
+			body: bodyText,
             signal: controller.signal
         });
         const payload = await response.json().catch(() => ({}));
@@ -209,11 +219,11 @@ function formatTimestamp(value) {
 }
 
 function licenseState(license) {
-    if (license.revokedAt) return "REVOKED";
-    if (license.pausedAt) return "PAUSED";
-    if (license.expiresAt && Number(license.expiresAt) <= Math.floor(Date.now() / 1000)) return "EXPIRED";
-    if (!license.activatedAt) return "UNUSED";
-    return "ACTIVE";
+	if (license.revokedAt) return "Revoked";
+	if (license.pausedAt) return "Paused";
+	if (license.expiresAt && Number(license.expiresAt) <= Math.floor(Date.now() / 1000)) return "Expired";
+	if (!license.activatedAt) return "Unused";
+	return "Active";
 }
 
 function licenseEmbed(license, title = "NYX license") {
@@ -429,6 +439,7 @@ const durations = [
 ];
 
 const commands = [
+	new SlashCommandBuilder().setName("panel").setDescription("Open your NYX account and support controls"),
     new SlashCommandBuilder().setName("help").setDescription("Show NYX bot commands and account setup"),
     new SlashCommandBuilder().setName("keygen").setDescription("Generate NYX website license keys")
         .addStringOption((option) => option.setName("duration").setDescription("License duration after activation").setRequired(true).addChoices(...durations))
@@ -723,13 +734,26 @@ function giveawayRow(id) {
 
 async function handleButton(interaction) {
     const [prefix, id] = interaction.customId.split(":");
-    if (!id || !["nyx_confirm", "nyx_cancel", "nyx_giveaway", "nyx_ticket_close"].includes(prefix)) return;
+	if (!id || !["nyx_confirm", "nyx_cancel", "nyx_giveaway", "nyx_ticket_close", "nyx_panel_status"].includes(prefix)) return;
     // Buttons are subject to the same server allowlist as commands.
     if (interaction.guildId && !isAllowedGuild(interaction.guildId)) {
         logDenied(interaction, "server not on allowlist");
         return interaction.reply({ embeds: [errorEmbed("Commands are not enabled in this server.")], ephemeral: true });
     }
     if (prefix === "nyx_giveaway") return handleGiveawayClaim(interaction, id);
+	if (prefix === "nyx_panel_status") {
+		if (id !== interaction.user.id) return interaction.reply({ embeds: [errorEmbed("This panel belongs to another user.")], ephemeral: true });
+		await interaction.deferReply({ ephemeral: true });
+		const result = await callAuthApi("/api/bot/status", { discordId: interaction.user.id });
+		if (!result.linked) {
+			return interaction.editReply({ embeds: [nyxEmbed("Account not linked", "Sign in on the website and connect Discord before launching.")] });
+		}
+		return interaction.editReply({ embeds: [nyxEmbed("Your NYX access").addFields(
+			{ name: "Account", value: result.username || "Linked", inline: true },
+			{ name: "License", value: String(result.status || result.reason || "unknown"), inline: true },
+			{ name: "Expires", value: result.expiresAt ? formatTimestamp(result.expiresAt) : "Lifetime", inline: true }
+		)] });
+	}
     if (prefix === "nyx_ticket_close") {
         const openerId = id;
         const isOpener = interaction.user.id === openerId;
@@ -811,10 +835,24 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.reply({ embeds: [errorEmbed("Unknown owner action.")], ephemeral: true });
         }
 
+		if (commandName === "panel") {
+			const controls = new ActionRowBuilder().addComponents(
+				new ButtonBuilder().setCustomId(`nyx_panel_status:${interaction.user.id}`).setLabel("My access").setStyle(ButtonStyle.Primary),
+				new ButtonBuilder().setLabel("Dashboard").setStyle(ButtonStyle.Link).setURL(`${CONFIG.AUTH_URL}/dashboard`),
+				new ButtonBuilder().setLabel("Download").setStyle(ButtonStyle.Link).setURL(`${CONFIG.AUTH_URL}/download`),
+				new ButtonBuilder().setLabel("Service status").setStyle(ButtonStyle.Link).setURL(`${CONFIG.AUTH_URL}/status`)
+			);
+			return interaction.reply({
+				embeds: [nyxEmbed("NYX control panel", "Check access, open your account, download the current release, or review service health.")],
+				components: [controls],
+				ephemeral: true
+			});
+		}
+
         if (commandName === "help") {
-            const embed = nyxEmbed("NYX command guide", "Website accounts use a license from this bot, a linked Discord account, and a one-time launch code.")
+			const embed = nyxEmbed("NYX commands", "Use `/panel` for the common account and launch actions.")
                 .addFields(
-                    { name: "Account", value: "`/help` — this guide\n`/health` — service availability\n`/mystatus` — linked account status\n`/redeem` — validate a key and get your registration link\n`/download` — client download link and latest version\n`/link` — how to connect Discord\n`/ticket` — open a private support ticket", inline: false },
+					{ name: "Account", value: "`/panel` `/health` `/mystatus` `/redeem` `/download` `/link` `/ticket`", inline: false },
                     { name: "License team", value: "`/keygen` `/keyinfo` `/keys` `/setgenrole`", inline: false },
                     { name: "Administrators", value: "`/stats` `/daily` `/digest` `/status` `/userlookup` `/whois` `/notifyall` `/notifyuser` `/giveaway` `/keyrevoke` `/keyreset` `/keyextend` `/keypause` `/keyresume` `/keynote`", inline: false },
                     { name: "Owner", value: "`/owner` — manage the server allowlist", inline: false }
@@ -884,7 +922,7 @@ client.on("interactionCreate", async (interaction) => {
             if (!result.licenses.length) return interaction.editReply({ embeds: [nyxEmbed("No results", "No NYX accounts or licenses matched that search.")] });
             const embed = nyxEmbed("NYX search results", `Showing ${Math.min(result.licenses.length, 10)} of ${result.licenses.length} matches.`);
             for (const license of result.licenses.slice(0, 10)) {
-                embed.addFields({ name: `${license.username || "Unused"} // ${licenseState(license)}`, value: `\`${license.keyPreview}\`\n${license.discordUsername ? `@${license.discordUsername}` : "No Discord"} · ${String(license.duration).toUpperCase()}`, inline: false });
+				embed.addFields({ name: `${license.username || "Unused"} · ${licenseState(license)}`, value: `\`${license.keyPreview}\`\n${license.discordUsername ? `@${license.discordUsername}` : "No Discord"} · ${String(license.duration).toUpperCase()}`, inline: false });
             }
             return interaction.editReply({ embeds: [embed] });
         }
