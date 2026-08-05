@@ -85,7 +85,7 @@ function isBotOwner(userId) {
 }
 
 // Public commands that are safe to run in DMs or non-whitelisted servers.
-const PUBLIC_COMMANDS = new Set(["panel", "help", "health", "mystatus", "download", "link"]);
+const PUBLIC_COMMANDS = new Set(["panel", "help", "health", "mystatus", "download", "link", "setup", "privacy"]);
 
 // Per-guild generator roles: { [guildId]: string[] }. Scoped so a role
 // configured in one server cannot grant key generation in another.
@@ -441,6 +441,8 @@ const durations = [
 const commands = [
 	new SlashCommandBuilder().setName("panel").setDescription("Open your NYX account and support controls"),
     new SlashCommandBuilder().setName("help").setDescription("Show NYX bot commands and account setup"),
+	new SlashCommandBuilder().setName("setup").setDescription("Open the guided NYX account setup checklist"),
+	new SlashCommandBuilder().setName("privacy").setDescription("See how NYX protects account and diagnostic information"),
     new SlashCommandBuilder().setName("keygen").setDescription("Generate NYX website license keys")
         .addStringOption((option) => option.setName("duration").setDescription("License duration after activation").setRequired(true).addChoices(...durations))
         .addIntegerOption((option) => option.setName("amount").setDescription("Number of keys, from 1 to 10").setMinValue(1).setMaxValue(10)),
@@ -835,7 +837,7 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.reply({ embeds: [errorEmbed("Unknown owner action.")], ephemeral: true });
         }
 
-		if (commandName === "panel") {
+        if (commandName === "panel") {
 			const controls = new ActionRowBuilder().addComponents(
 				new ButtonBuilder().setCustomId(`nyx_panel_status:${interaction.user.id}`).setLabel("My access").setStyle(ButtonStyle.Primary),
 				new ButtonBuilder().setLabel("Dashboard").setStyle(ButtonStyle.Link).setURL(`${CONFIG.AUTH_URL}/dashboard`),
@@ -847,12 +849,43 @@ client.on("interactionCreate", async (interaction) => {
 				components: [controls],
 				ephemeral: true
 			});
+        }
+
+		if (commandName === "setup") {
+			const row = new ActionRowBuilder().addComponents(
+				new ButtonBuilder().setLabel("Create account").setStyle(ButtonStyle.Link).setURL(`${CONFIG.AUTH_URL}/register`),
+				new ButtonBuilder().setLabel("Open dashboard").setStyle(ButtonStyle.Link).setURL(`${CONFIG.AUTH_URL}/dashboard`),
+				new ButtonBuilder().setLabel("Check status").setStyle(ButtonStyle.Link).setURL(`${CONFIG.AUTH_URL}/status`)
+			);
+			const embed = nyxEmbed("Set up NYX", "Complete these steps in order. You can come back to this checklist at any time.")
+				.addFields(
+					{ name: "1  Create or sign in", value: "Register with your license, then secure the account with a unique password or passkey.", inline: false },
+					{ name: "2  Connect Discord", value: "Open the dashboard and connect the same Discord account you are using now.", inline: false },
+					{ name: "3  Verify access", value: "Run `/mystatus`. If your license is active, the dashboard can issue a short-lived one-time code.", inline: false }
+				)
+				.setFooter({ text: "NYX account services • Never share one-time codes" });
+			return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+		}
+
+		if (commandName === "privacy") {
+			const row = new ActionRowBuilder().addComponents(
+				new ButtonBuilder().setLabel("Privacy policy").setStyle(ButtonStyle.Link).setURL(`${CONFIG.AUTH_URL}/privacy`),
+				new ButtonBuilder().setLabel("Account settings").setStyle(ButtonStyle.Link).setURL(`${CONFIG.AUTH_URL}/settings`),
+				new ButtonBuilder().setLabel("Support").setStyle(ButtonStyle.Link).setURL(`${CONFIG.AUTH_URL}/support`)
+			);
+			const embed = nyxEmbed("Privacy & account safety", "NYX bot responses keep account details private and redact sensitive identifiers.")
+				.addFields(
+					{ name: "Never share", value: "Passwords, one-time codes, complete license keys, session tokens, or full device identifiers.", inline: false },
+					{ name: "Safe diagnostics", value: "Use the client's **Copy redacted report** action or the website support checklist. Review anything before sending it.", inline: false },
+					{ name: "Session control", value: "Review active sessions in account settings and revoke anything you do not recognize.", inline: false }
+				);
+			return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
 		}
 
         if (commandName === "help") {
 			const embed = nyxEmbed("NYX commands", "Use `/panel` for the common account and launch actions.")
                 .addFields(
-					{ name: "Account", value: "`/panel` `/health` `/mystatus` `/redeem` `/download` `/link` `/ticket`", inline: false },
+					{ name: "Account", value: "`/panel` `/setup` `/health` `/mystatus` `/redeem` `/download` `/link` `/privacy` `/ticket`", inline: false },
                     { name: "License team", value: "`/keygen` `/keyinfo` `/keys` `/setgenrole`", inline: false },
                     { name: "Administrators", value: "`/stats` `/daily` `/digest` `/status` `/userlookup` `/whois` `/notifyall` `/notifyuser` `/giveaway` `/keyrevoke` `/keyreset` `/keyextend` `/keypause` `/keyresume` `/keynote`", inline: false },
                     { name: "Owner", value: "`/owner` — manage the server allowlist", inline: false }
